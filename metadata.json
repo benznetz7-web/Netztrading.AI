@@ -1,0 +1,6 @@
+{
+  "name": "NETHAGA PRO",
+  "description": "Fast Multi-Strategy Forex, Gold & Crypto Trading Terminal with Momentum 8/21, Squeeze Breakout, Key-Level S/R, Anti-Spike Guard, and Live BIQUOTE SignalR Feed.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

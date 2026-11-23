@@ -1,0 +1,1039 @@
+import { SYMBOL_SPECS, TF_PROFILES } from '../constants/markets';
+import type {
+  BlockZone,
+  CandleBar,
+  ComputedSymbolSpec,
+  DangerInfo,
+  FVGAnalysis,
+  FVGZone,
+  KeyLevelPoint,
+  KeyLevels,
+  MarketStructure,
+  ProviderType,
+  QuoteData,
+  RegimeInfo,
+  RiskCalcResult,
+  RiskConfig,
+  SignalOutput,
+  SymbolSpec,
+  TimeframeKey,
+  WalkForwardStats,
+} from '../types/trading';
+import {
+  calculateADX,
+  calculateATRSeries,
+  calculateEfficiencyRatio,
+  calculateEMASeries,
+  calculateMACD,
+  calculateRSI,
+  calculateSqueezeAndBands,
+  fmtPrice,
+} from './indicators';
+
+export type BrokerSpecOverrideMap = Record<string, Partial<SymbolSpec>>;
+
+export function getSymbolSpec(
+  sym: string,
+  prov: ProviderType,
+  midOv: number | null | undefined,
+  riskConfig: RiskConfig,
+  brokerSpecsOverride: BrokerSpecOverrideMap,
+  liveQuoteMid?: number | null
+): ComputedSymbolSpec {
+  const b = SYMBOL_SPECS[sym];
+  if (!b) {
+    return {
+      verified: false,
+      reason: `Unknown ${sym}`,
+      digits: 2,
+      pointSize: 0.01,
+      pipSize: 0.1,
+      tickSize: 0.01,
+      volumeMin: 0.01,
+      volumeStep: 0.01,
+      slippagePoints: 10,
+      desk: 'FOREX',
+      group: 'FX',
+      specNote: 'UNVERIFIED',
+    };
+  }
+  const br = prov === 'EXNESS' ? brokerSpecsOverride[sym] : null;
+  const m: SymbolSpec = br ? { ...b, ...br } : { ...b };
+  const mult = riskConfig.contractMode === 'CENT' ? 0.01 : 1.0;
+  const effC = m.contractSize * mult;
+
+  if (
+    !m.verified ||
+    ![m.digits, m.pointSize, m.pipSize, m.tickSize, effC, m.volumeMin, m.volumeStep].every(
+      (v) => Number.isFinite(v) && v > 0
+    )
+  ) {
+    return { ...m, verified: false, reason: 'Invalid spec' };
+  }
+
+  const refM = Number.isFinite(midOv) && (midOv as number) > 0 ? (midOv as number) : liveQuoteMid ?? null;
+  let tv = m.tickValueUsd;
+  if (!Number.isFinite(tv) || (tv as number) <= 0) {
+    if (m.quoteCcy === 'USD') {
+      tv = effC * m.tickSize;
+    } else {
+      if (!(refM && refM > 0)) {
+        return { ...m, effectiveContractSize: effC, verified: false, reason: `Need ${sym} rate` };
+      }
+      tv = (effC * m.tickSize) / refM;
+    }
+  } else {
+    tv = (tv as number) * mult;
+  }
+
+  return {
+    ...m,
+    contractMultiplier: mult,
+    effectiveContractSize: effC,
+    tickValueUsd: tv,
+    commissionPerLotUsd: Math.max(0, Number(riskConfig.commission ?? 0)) * mult,
+    verified: true,
+  };
+}
+
+export function computePositionRiskAndCosts(
+  slDist: number,
+  quote: { spread?: number } | null,
+  spec: ComputedSymbolSpec,
+  riskConfig: RiskConfig,
+  riskScale = 1.0
+): RiskCalcResult {
+  if (!spec || !spec.verified || !spec.tickValueUsd) {
+    return { valid: false, lots: spec?.volumeMin || 0.01, reason: spec?.reason || 'UNVERIFIED spec' };
+  }
+  if (!(slDist > 0) || !Number.isFinite(slDist)) {
+    return { valid: false, lots: spec.volumeMin, reason: 'Invalid SL' };
+  }
+  const eq = Math.max(5, Number(riskConfig.balance || 80));
+  const rp = Math.max(0.1, Math.min(5.0, Number(riskConfig.riskPercent || 0.5)));
+  const scaledBudget = eq * (rp / 100) * riskScale;
+  const slTicks = slDist / spec.tickSize;
+  const loss1 = slTicks * spec.tickValueUsd;
+  const comm1 = spec.commissionPerLotUsd || 0;
+  const slipPx = spec.slippagePoints * spec.pointSize * 2;
+  const slip1 = (slipPx / spec.tickSize) * spec.tickValueUsd;
+  const tot1 = loss1 + comm1 + slip1;
+  const minRisk = tot1 * spec.volumeMin;
+  const costInPrice = (quote?.spread || 0) + slipPx + comm1 / (spec.tickValueUsd / spec.tickSize);
+
+  if (minRisk > scaledBudget) {
+    return {
+      valid: false,
+      minLotExceeds: true,
+      riskBudgetUsd: scaledBudget,
+      minLotRiskUsd: minRisk,
+      lots: spec.volumeMin,
+      actualRiskUsd: minRisk,
+      costInPrice,
+      reason: `0.01 lot risks $${minRisk.toFixed(2)} > $${scaledBudget.toFixed(2)}`,
+    };
+  }
+  const lots = Number(
+    Math.max(spec.volumeMin, Math.floor(scaledBudget / tot1 / spec.volumeStep) * spec.volumeStep).toFixed(2)
+  );
+  return {
+    valid: true,
+    minLotExceeds: false,
+    riskBudgetUsd: scaledBudget,
+    minLotRiskUsd: minRisk,
+    lots,
+    actualRiskUsd: lots * tot1,
+    costInPrice,
+    reason: `Lot ${lots.toFixed(2)} risks $${(lots * tot1).toFixed(2)}`,
+  };
+}
+
+export function classifyMarketRegimeAndDanger(
+  bars: CandleBar[],
+  atrS: number[],
+  spread: number,
+  maxSpreadRatio: number,
+  squeezeOn: boolean
+): { regime: RegimeInfo; danger: DangerInfo } {
+  const a14 = atrS.length ? atrS[atrS.length - 1] : 0;
+  const a50 = atrS.length >= 20 ? atrS.slice(-50).reduce((a, b) => a + b, 0) / Math.min(50, atrS.length) : a14;
+  const atrR = a50 > 0 ? a14 / a50 : 1;
+  const adx = calculateADX(bars, 14) ?? 20;
+  const er = calculateEfficiencyRatio(bars, 12);
+
+  let regime = 'RANGING';
+  if (atrR >= 1.65) regime = 'HIGH_VOL';
+  else if (squeezeOn) regime = 'SQUEEZE';
+  else if (adx >= 18 || er >= 0.24) regime = 'TRENDING';
+  else if (atrR <= 0.50 && adx < 16) regime = 'LOW_VOL';
+
+  let dangerPct = 15;
+  if (adx < 16) dangerPct += 15;
+  if (er < 0.16) dangerPct += 12;
+  if (atrR >= 1.65 || atrR <= 0.50) dangerPct += 15;
+  if (a14 > 0 && spread > a14 * maxSpreadRatio) dangerPct += 20;
+  dangerPct = Math.min(95, dangerPct);
+
+  let tier: DangerInfo['tier'] = 'CLEAN';
+  let riskScale = 1.0;
+  let tp1R = 0.90;
+  let tp2R = 1.65;
+  if (dangerPct >= 50) {
+    tier = 'HIGH DANGER';
+    riskScale = 0.35;
+    tp1R = 0.80;
+    tp2R = 1.35;
+  } else if (dangerPct >= 25) {
+    tier = 'CAUTION';
+    riskScale = 0.50;
+    tp1R = 0.85;
+    tp2R = 1.50;
+  }
+
+  return {
+    regime: {
+      regime,
+      adx,
+      atrRatio: atrR,
+      er,
+      squeeze: squeezeOn,
+      label: `${regime} (ADX ${adx.toFixed(1)}, ATRx ${atrR.toFixed(2)})`,
+    },
+    danger: {
+      tier,
+      pct: dangerPct,
+      riskScale,
+      tp1R,
+      tp2R,
+      label: `${tier} (${dangerPct}%)`,
+    },
+  };
+}
+
+export function detectConfirmedSwings(c: CandleBar[], atr = 0) {
+  const swingHighs: Array<{ index: number; price: number; plateauBars: number }> = [];
+  const swingLows: Array<{ index: number; price: number; plateauBars: number }> = [];
+  const n = c.length;
+  if (n < 5) return { swingHighs, swingLows, eqHigh: null as number | null, eqLow: null as number | null };
+
+  const eps = Math.max(1e-9, (atr || 0) * 0.01);
+  let i = 1;
+  while (i < n - 1) {
+    const h = c[i].high;
+    let end = i;
+    while (end + 1 < n - 1 && Math.abs(c[end + 1].high - h) <= eps) end++;
+    if (h > c[i - 1].high + eps && (i < 2 || h >= c[i - 2].high - eps) && end + 1 < n && h > c[end + 1].high + eps) {
+      swingHighs.push({
+        index: end,
+        price: Math.max(...c.slice(i, end + 1).map((x) => x.high)),
+        plateauBars: end - i + 1,
+      });
+    }
+    i = end + 1;
+  }
+
+  let j = 1;
+  while (j < n - 1) {
+    const l = c[j].low;
+    let end = j;
+    while (end + 1 < n - 1 && Math.abs(c[end + 1].low - l) <= eps) end++;
+    if (l < c[j - 1].low - eps && (j < 2 || l <= c[j - 2].low + eps) && end + 1 < n && l < c[end + 1].low - eps) {
+      swingLows.push({
+        index: end,
+        price: Math.min(...c.slice(j, end + 1).map((x) => x.low)),
+        plateauBars: end - j + 1,
+      });
+    }
+    j = end + 1;
+  }
+
+  const eqT = Math.max(1e-9, (atr || 0) * 0.15);
+  let eqHigh: number | null = null;
+  let eqLow: number | null = null;
+  for (let a = swingHighs.length - 1; a >= 1; a--) {
+    if (swingHighs[a].index - swingHighs[a - 1].index >= 2 && Math.abs(swingHighs[a].price - swingHighs[a - 1].price) <= eqT) {
+      eqHigh = (swingHighs[a].price + swingHighs[a - 1].price) / 2;
+      break;
+    }
+  }
+  for (let a = swingLows.length - 1; a >= 1; a--) {
+    if (swingLows[a].index - swingLows[a - 1].index >= 2 && Math.abs(swingLows[a].price - swingLows[a - 1].price) <= eqT) {
+      eqLow = (swingLows[a].price + swingLows[a - 1].price) / 2;
+      break;
+    }
+  }
+  return { swingHighs, swingLows, eqHigh, eqLow };
+}
+
+export function extractKeyLevels(
+  closedBars: CandleBar[],
+  d1Bars: CandleBar[] | null,
+  h1Bars: CandleBar[] | null,
+  atr: number,
+  sym: string,
+  refPrice: number
+): KeyLevels {
+  const spec = SYMBOL_SPECS[sym] || { roundStep: 10 };
+  const rawLevels: Array<{ price: number; tag: string; weight: number }> = [];
+  const add = (price: number | null | undefined, tag: string, weight: number) => {
+    if (typeof price === 'number' && Number.isFinite(price) && price > 0) {
+      rawLevels.push({ price, tag, weight });
+    }
+  };
+
+  const { swingHighs, swingLows, eqHigh, eqLow } = detectConfirmedSwings(closedBars.slice(-120), atr);
+  swingHighs.slice(-10).forEach((s) => add(s.price, 'Swing', 2));
+  swingLows.slice(-10).forEach((s) => add(s.price, 'Swing', 2));
+  if (eqHigh) add(eqHigh, 'EQH', 3);
+  if (eqLow) add(eqLow, 'EQL', 3);
+
+  let pdh: number | null = null;
+  let pdl: number | null = null;
+  if (d1Bars && d1Bars.length >= 1) {
+    const prevD = d1Bars[d1Bars.length - 1];
+    pdh = prevD.high;
+    pdl = prevD.low;
+    add(pdh, 'PDH', 4);
+    add(pdl, 'PDL', 4);
+  }
+  if (h1Bars && h1Bars.length >= 20) {
+    const hSw = detectConfirmedSwings(h1Bars.slice(-60), atr);
+    hSw.swingHighs.slice(-4).forEach((s) => add(s.price, 'H1', 3));
+    hSw.swingLows.slice(-4).forEach((s) => add(s.price, 'H1', 3));
+  }
+
+  const step = spec.roundStep || 10;
+  const baseR = Math.round(refPrice / step) * step;
+  [-2, -1, 0, 1, 2].forEach((k) => add(baseR + k * step, 'Round', 1));
+
+  const tol = Math.max(refPrice * 0.0012, (atr || refPrice * 0.002) * 0.45);
+  const clusters: Array<{ price: number; touches: number; weight: number; tags: Set<string> }> = [];
+  for (const lvl of rawLevels.sort((a, b) => a.price - b.price)) {
+    const match = clusters.find((c) => Math.abs(c.price - lvl.price) <= tol);
+    if (match) {
+      match.touches++;
+      match.weight += lvl.weight;
+      match.tags.add(lvl.tag);
+      match.price = (match.price * (match.touches - 1) + lvl.price) / match.touches;
+    } else {
+      clusters.push({ price: lvl.price, touches: 1, weight: lvl.weight, tags: new Set([lvl.tag]) });
+    }
+  }
+
+  const minGap = Math.max(tol * 1.2, refPrice * 0.0008);
+  const above = clusters.filter((c) => c.price > refPrice + minGap * 0.25).sort((a, b) => a.price - b.price);
+  const below = clusters.filter((c) => c.price < refPrice - minGap * 0.25).sort((a, b) => b.price - a.price);
+  const r1 = above[0] || null;
+  const r2 = above.find((c) => !r1 || c.price - r1.price >= minGap) || above[1] || null;
+  const s1 = below[0] || null;
+  const s2 = below.find((c) => !s1 || s1.price - c.price >= minGap) || below[1] || null;
+
+  const fmtC = (c: typeof clusters[number] | null): KeyLevelPoint | null =>
+    c ? { price: c.price, touches: c.touches, weight: c.weight, tags: [...c.tags].slice(0, 2).join('+') } : null;
+
+  return { r1: fmtC(r1), r2: fmtC(r2), s1: fmtC(s1), s2: fmtC(s2), pdh, pdl, eqHigh, eqLow, all: clusters.slice(0, 10) };
+}
+
+export function analyzeMarketStructure(c: CandleBar[], atr: number, sym: string, bosLookback = 18): MarketStructure {
+  if (c.length < 25) {
+    return {
+      type: 'NEUTRAL',
+      kind: 'NONE',
+      swingSequence: 'MIXED',
+      swingHigh: null,
+      swingLow: null,
+      eqHigh: null,
+      eqLow: null,
+      sweep: null,
+      inPullback: false,
+      label: 'Insufficient bars',
+    };
+  }
+  const { swingHighs, swingLows, eqHigh, eqLow } = detectConfirmedSwings(c, atr);
+  const rH = swingHighs.length
+    ? swingHighs[swingHighs.length - 1]
+    : { index: c.length - 4, price: Math.max(...c.slice(-15, -1).map((x) => x.high)) };
+  const rL = swingLows.length
+    ? swingLows[swingLows.length - 1]
+    : { index: c.length - 4, price: Math.min(...c.slice(-15, -1).map((x) => x.low)) };
+
+  let seq = 'MIXED';
+  let pb: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+  if (swingHighs.length >= 2 && swingLows.length >= 2) {
+    const hh = swingHighs[swingHighs.length - 1].price > swingHighs[swingHighs.length - 2].price;
+    const hl = swingLows[swingLows.length - 1].price > swingLows[swingLows.length - 2].price;
+    const lh = swingHighs[swingHighs.length - 1].price < swingHighs[swingHighs.length - 2].price;
+    const ll = swingLows[swingLows.length - 1].price < swingLows[swingLows.length - 2].price;
+    if (hh && hl) {
+      pb = 'BULLISH';
+      seq = 'HH/HL';
+    } else if (lh && ll) {
+      pb = 'BEARISH';
+      seq = 'LH/LL';
+    }
+  }
+
+  const last = c[c.length - 1];
+  const prev = c[c.length - 2];
+  let sweep: MarketStructure['sweep'] = null;
+  for (const b of [prev, last]) {
+    if (b.low < rL.price && b.close > rL.price) sweep = { type: 'BULLISH', level: rL.price, label: 'Bull Sweep' };
+    if (b.high > rH.price && b.close < rH.price) sweep = { type: 'BEARISH', level: rH.price, label: 'Bear Sweep' };
+  }
+
+  const mm = (atr || 0) * 0.04;
+  let brk: { type: 'BULLISH' | 'BEARISH'; kind: string; level: number; idx: number } | null = null;
+  for (let idx = Math.max(2, c.length - bosLookback); idx < c.length; idx++) {
+    const b = c[idx];
+    const sh = swingHighs.filter((s) => s.index < idx).pop();
+    const sl = swingLows.filter((s) => s.index < idx).pop();
+    if (sh && b.close > sh.price + mm) brk = { type: 'BULLISH', kind: pb === 'BEARISH' ? 'CHoCH' : 'BOS', level: sh.price, idx };
+    if (sl && b.close < sl.price - mm) brk = { type: 'BEARISH', kind: pb === 'BULLISH' ? 'CHoCH' : 'BOS', level: sl.price, idx };
+  }
+
+  if (brk?.type === 'BULLISH' && last.close >= rL.price) {
+    const peak = Math.max(...c.slice(brk.idx).map((x) => x.high));
+    const inPullback = last.close < peak - (atr || 0) * 0.15;
+    return { type: 'BULLISH', kind: brk.kind, swingSequence: seq, swingHigh: rH.price, swingLow: rL.price, eqHigh, eqLow, sweep, inPullback, label: `Bull ${brk.kind} (${seq})${inPullback ? ' · Pullback' : ''}` };
+  }
+  if (brk?.type === 'BEARISH' && last.close <= rH.price) {
+    const tr = Math.min(...c.slice(brk.idx).map((x) => x.low));
+    const inPullback = last.close > tr + (atr || 0) * 0.15;
+    return { type: 'BEARISH', kind: brk.kind, swingSequence: seq, swingHigh: rH.price, swingLow: rL.price, eqHigh, eqLow, sweep, inPullback, label: `Bear ${brk.kind} (${seq})${inPullback ? ' · Pullback' : ''}` };
+  }
+  if (pb === 'BULLISH' && last.close >= rL.price) {
+    return { type: 'BULLISH', kind: 'BOS', swingSequence: seq, swingHigh: rH.price, swingLow: rL.price, eqHigh, eqLow, sweep, inPullback: true, label: `Bull HH/HL > ${fmtPrice(rL.price, sym)}` };
+  }
+  if (pb === 'BEARISH' && last.close <= rH.price) {
+    return { type: 'BEARISH', kind: 'BOS', swingSequence: seq, swingHigh: rH.price, swingLow: rL.price, eqHigh, eqLow, sweep, inPullback: true, label: `Bear LH/LL < ${fmtPrice(rH.price, sym)}` };
+  }
+  return { type: 'NEUTRAL', kind: 'NONE', swingSequence: seq, swingHigh: rH.price, swingLow: rL.price, eqHigh, eqLow, sweep, inPullback: false, label: `Range ${fmtPrice(rL.price, sym)}–${fmtPrice(rH.price, sym)}` };
+}
+
+export function detectOrderAndBreakerBlocks(c: CandleBar[], st: MarketStructure, sym: string): { ob: BlockZone; breaker: BlockZone } {
+  let ob: BlockZone = { type: 'NONE', high: 0, low: 0, index: -1, retested: false, label: 'None' };
+  let breaker: BlockZone = { type: 'NONE', high: 0, low: 0, index: -1, label: 'None' };
+  if (st.type === 'NEUTRAL') return { ob, breaker };
+  const last = c[c.length - 1];
+  for (let i = c.length - 2; i >= Math.max(1, c.length - 28); i--) {
+    const x = c[i];
+    const isBullO = x.close < x.open;
+    const isBearO = x.close > x.open;
+    if (st.type === 'BULLISH' && isBullO && ob.type === 'NONE') {
+      let br = false;
+      for (let j = i + 1; j < c.length; j++) {
+        if (c[j].close < x.low) { br = true; break; }
+      }
+      if (!br) ob = { type: 'BULLISH', high: x.high, low: x.low, index: i, retested: last.low <= x.high && last.close >= x.low, label: `Demand OB ${fmtPrice(x.low, sym)}` };
+    }
+    if (st.type === 'BEARISH' && isBearO && ob.type === 'NONE') {
+      let br = false;
+      for (let j = i + 1; j < c.length; j++) {
+        if (c[j].close > x.high) { br = true; break; }
+      }
+      if (!br) ob = { type: 'BEARISH', high: x.high, low: x.low, index: i, retested: last.high >= x.low && last.close <= x.high, label: `Supply OB ${fmtPrice(x.high, sym)}` };
+    }
+    if (st.type === 'BULLISH' && isBearO && breaker.type === 'NONE') {
+      let ca = false;
+      for (let j = i + 1; j < c.length; j++) {
+        if (c[j].close > x.high) { ca = true; break; }
+      }
+      if (ca && last.close >= x.low) breaker = { type: 'BULLISH', high: x.high, low: x.low, index: i, label: 'Bull Breaker' };
+    }
+    if (st.type === 'BEARISH' && isBullO && breaker.type === 'NONE') {
+      let cb = false;
+      for (let j = i + 1; j < c.length; j++) {
+        if (c[j].close < x.low) { cb = true; break; }
+      }
+      if (cb && last.close <= x.high) breaker = { type: 'BEARISH', high: x.high, low: x.low, index: i, label: 'Bear Breaker' };
+    }
+  }
+  return { ob, breaker };
+}
+
+export function analyzeFVGs(c: CandleBar[], atr: number, sym = 'XAUUSD'): FVGAnalysis {
+  const all: FVGZone[] = [];
+  for (let i = Math.max(2, c.length - 60); i < c.length; i++) {
+    const f = c[i - 2];
+    const t = c[i];
+    if (t.low > f.high) all.push({ type: 'BULLISH', top: t.low, bottom: f.high, index: i - 1, mitigated: false, invalidated: false });
+    else if (t.high < f.low) all.push({ type: 'BEARISH', top: f.low, bottom: t.high, index: i - 1, mitigated: false, invalidated: false });
+  }
+  for (const z of all) {
+    for (let j = z.index + 2; j < c.length; j++) {
+      const b = c[j];
+      if (z.type === 'BULLISH') {
+        if (b.low <= z.top) z.mitigated = true;
+        if (b.close < z.bottom) { z.invalidated = true; break; }
+      } else {
+        if (b.high >= z.bottom) z.mitigated = true;
+        if (b.close > z.top) { z.invalidated = true; break; }
+      }
+    }
+  }
+  const vB = all.filter((z) => z.type === 'BULLISH' && !z.invalidated);
+  const vS = all.filter((z) => z.type === 'BEARISH' && !z.invalidated);
+  const lB = vB.length ? vB[vB.length - 1] : null;
+  const lS = vS.length ? vS[vS.length - 1] : null;
+  const last = c[c.length - 1];
+  const prev = c[c.length - 2];
+  const tol = (atr || 0) * 0.25;
+  const retB = Boolean(lB && Math.min(last.low, prev.low) <= lB.top + tol && last.close >= lB.bottom && last.close > last.open);
+  const retS = Boolean(lS && Math.max(last.high, prev.high) >= lS.bottom - tol && last.close <= lS.top && last.close < last.open);
+  const parts: string[] = [];
+  if (lB) parts.push(`Bull ${fmtPrice(lB.bottom, sym)}`);
+  if (lS) parts.push(`Bear ${fmtPrice(lS.top, sym)}`);
+  return { validBull: vB, validBear: vS, latestBull: lB, latestBear: lS, retestedBullFvg: retB, retestedBearFvg: retS, label: parts.length ? parts.join(' | ') : 'None active' };
+}
+
+export function detectFastAndKeyTriggers(
+  closedBars: CandleBar[],
+  keyLevels: KeyLevels,
+  atr: number,
+  e8: number,
+  e21: number,
+  macd: { hist: number; prevHist: number },
+  sq: { squeezePopUp: boolean; squeezePopDown: boolean },
+  st: MarketStructure
+) {
+  const last = closedBars[closedBars.length - 1];
+  const prev = closedBars[closedBars.length - 2];
+  const rng = Math.max(1e-9, last.high - last.low);
+  const body = Math.abs(last.close - last.open);
+  const lw = Math.min(last.open, last.close) - last.low;
+  const uw = last.high - Math.max(last.open, last.close);
+
+  const bullEngulf = last.close > last.open && prev.close < prev.open && last.close >= prev.open && last.open <= prev.close;
+  const bearEngulf = last.close < last.open && prev.close > prev.open && last.close <= prev.open && last.open >= prev.close;
+  const bullPin = lw >= body * 1.2 && lw >= rng * 0.35 && uw <= rng * 0.35;
+  const bearPin = uw >= body * 1.2 && uw >= rng * 0.35 && lw <= rng * 0.35;
+  const bullClose = last.close > last.open && body >= rng * 0.22;
+  const bearClose = last.close < last.open && body >= rng * 0.22;
+
+  // Anti-Spike Guard: only block extreme blow-off spikes (> 3.2 * ATR from EMA8 OR huge single spike bar > 2.8 * ATR)
+  const distFromE8 = Math.abs(last.close - e8);
+  const extremeSpike = distFromE8 > atr * 3.2 || body > atr * 2.8;
+  const notChasedBull = !extremeSpike;
+  const notChasedBear = !extremeSpike;
+
+  // S/R Bounce & S/R Breakout
+  const zoneTol = Math.max(atr * 0.75, last.close * 0.0005);
+  const s1 = keyLevels.s1?.price;
+  const r1 = keyLevels.r1?.price;
+  const srBullBounce = Boolean(s1 && last.low <= s1 + zoneTol && last.close > s1 && (bullPin || bullEngulf || bullClose));
+  const srBearReject = Boolean(r1 && last.high >= r1 - zoneTol && last.close < r1 && (bearPin || bearEngulf || bearClose));
+  const srBreakoutBull = Boolean(r1 && prev.close <= r1 && last.close > r1 && bullClose);
+  const srBreakoutBear = Boolean(s1 && prev.close >= s1 && last.close < s1 && bearClose);
+
+  // Fast Strategy 1: Trend Momentum (EMA 8/21 alignment with bullish/bearish bar OR MACD momentum)
+  const macdBull = macd.hist > 0 || (macd.hist > macd.prevHist && bullClose);
+  const macdBear = macd.hist < 0 || (macd.hist < macd.prevHist && bearClose);
+  const fastMomentumBull = e8 > e21 && (bullClose || macdBull) && last.close > e21;
+  const fastMomentumBear = e8 < e21 && (bearClose || macdBear) && last.close < e21;
+
+  // Fast Strategy 2: Squeeze Breakout
+  const squeezeBreakBull = sq.squeezePopUp && e8 >= e21 && bullClose;
+  const squeezeBreakBear = sq.squeezePopDown && e8 <= e21 && bearClose;
+
+  // Strategy 3: Break & Retest
+  const bullBreakRetest = Boolean(keyLevels.all.some((k) => prev.close > k.price && last.low <= k.price + zoneTol && last.close > k.price && bullClose));
+  const bearBreakRetest = Boolean(keyLevels.all.some((k) => prev.close < k.price && last.high >= k.price - zoneTol && last.close < k.price && bearClose));
+
+  // Strategy 4: Structure / Price Action Impulse
+  const paBull = (bullEngulf || bullPin || (st.type === 'BULLISH' && bullClose));
+  const paBear = (bearEngulf || bearPin || (st.type === 'BEARISH' && bearClose));
+
+  return {
+    bullClose,
+    bearClose,
+    srBullBounce,
+    srBearReject,
+    srBreakoutBull,
+    srBreakoutBear,
+    fastMomentumBull,
+    fastMomentumBear,
+    squeezeBreakBull,
+    squeezeBreakBear,
+    bullBreakRetest,
+    bearBreakRetest,
+    paBull,
+    paBear,
+    notChasedBull,
+    notChasedBear,
+    extremeSpike,
+  };
+}
+
+export function evaluateHTFContext(bars: CandleBar[] | null, lbl: string, sym: string) {
+  if (!bars || bars.length < 25) return { bias: 'NEUTRAL', wB: 5, wS: 5, label: `${lbl}: Neutral` };
+  const cl = bars.map((x) => x.close);
+  const e8 = calculateEMASeries(cl, 8).pop()!;
+  const e21 = calculateEMASeries(cl, 21).pop()!;
+  const atrS = calculateATRSeries(bars, 14);
+  const atr = atrS.length ? atrS[atrS.length - 1] : 0;
+  const st = analyzeMarketStructure(bars, atr, sym, 14);
+  let bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+  if (e8 > e21 || st.type === 'BULLISH') bias = 'BULLISH';
+  else if (e8 < e21 || st.type === 'BEARISH') bias = 'BEARISH';
+  return {
+    bias,
+    wB: bias === 'BULLISH' ? 15 : bias === 'NEUTRAL' ? 5 : 0,
+    wS: bias === 'BEARISH' ? 15 : bias === 'NEUTRAL' ? 5 : 0,
+    label: `${lbl}: ${bias}`,
+  };
+}
+
+export interface EvaluateSetupContext {
+  provider: ProviderType;
+  riskConfig: RiskConfig;
+  brokerSpecsOverride: BrokerSpecOverrideMap;
+  liveQuote: QuoteData | null;
+  freshness: { available: boolean; fresh: boolean; status: string; label: string };
+  historicalMode?: boolean;
+  simQuote?: { bid: number; ask: number; mid: number; spread: number } | null;
+}
+
+export function evaluateSetup(
+  symbol: string,
+  tf: TimeframeKey,
+  closedBars: CandleBar[],
+  formingBar: CandleBar | null,
+  htfBars: CandleBar[] | null,
+  d1Bars: CandleBar[] | null,
+  h1Bars: CandleBar[] | null,
+  ctx: EvaluateSetupContext
+): SignalOutput {
+  const { provider, riskConfig, brokerSpecsOverride, historicalMode = false, simQuote = null } = ctx;
+  const prof = TF_PROFILES[tf] || TF_PROFILES.M15;
+  const freshness = historicalMode
+    ? { available: true, fresh: true, status: 'LIVE', label: 'HISTORICAL' }
+    : ctx.freshness;
+  const quote = historicalMode ? simQuote : ctx.liveQuote;
+  const spec = getSymbolSpec(symbol, provider, quote?.mid, riskConfig, brokerSpecsOverride, ctx.liveQuote?.mid);
+  const htfLabel = TF_PROFILES[prof.htf]?.label || prof.htf;
+
+  const mk = (ov: Partial<SignalOutput>): SignalOutput => ({
+    asset: symbol,
+    tf,
+    source: provider,
+    state: 'WAIT',
+    type: 'WAIT',
+    entryMode: 'NONE',
+    entry: null,
+    entryZone: null,
+    tp1: null,
+    tp2: null,
+    tp3: null,
+    sl: null,
+    grossRR: null,
+    netRR: null,
+    rrText: '—',
+    danger: { tier: 'CLEAN', pct: 15, riskScale: 1.0, tp1R: 0.90, tp2R: 1.65, label: 'CLEAN' },
+    regime: { regime: 'UNKNOWN', adx: 0, atrRatio: 1, er: 0, squeeze: false, label: '—' },
+    keyLevels: { r1: null, r2: null, s1: null, s2: null, pdh: null, pdl: null, all: [] },
+    watchNote: null,
+    htfSummary: htfLabel,
+    setupScore: 0,
+    rules: [],
+    diagVeto: 'None',
+    diagSetup: '—',
+    diagTrigger: '—',
+    ema8: null,
+    ema21: null,
+    macdHist: null,
+    rsi14: null,
+    atr14: null,
+    fvg: { validBull: [], validBear: [], latestBull: null, latestBear: null, label: '—' },
+    structure: { type: 'NEUTRAL', kind: 'NONE', label: '—', eqHigh: null, eqLow: null, sweep: null },
+    ob: { type: 'NONE', high: 0, low: 0, index: -1, label: '—' },
+    breaker: { type: 'NONE', high: 0, low: 0, index: -1, label: 'None' },
+    riskCalc: null,
+    locked: false,
+    reversalWarning: false,
+    tp1Hit: false,
+    tp2Hit: false,
+    closedCount: closedBars?.length || 0,
+    formingBar,
+    candleTime: closedBars?.length ? closedBars[closedBars.length - 1].timeMs : 0,
+    time: new Date().toLocaleTimeString('en-US', { hour12: false }),
+    reason: '—',
+    ...ov,
+  });
+
+  if (!freshness.available || !freshness.fresh || !quote || !(quote.bid > 0) || !(quote.ask >= quote.bid)) {
+    return mk({ state: 'NO TRADE', diagVeto: freshness.label, reason: `NO TRADE: ${freshness.label}` });
+  }
+  if (!closedBars || closedBars.length < 30) {
+    return mk({ state: 'NO TRADE', diagVeto: `Need 30 bars (${closedBars?.length || 0})`, reason: 'NO TRADE: Insufficient candles' });
+  }
+
+  const closes = closedBars.map((c) => c.close);
+  const e8S = calculateEMASeries(closes, 8);
+  const e21S = calculateEMASeries(closes, 21);
+  const e8 = e8S[e8S.length - 1];
+  const e21 = e21S[e21S.length - 1];
+  const rsi14 = calculateRSI(closes, 14);
+  const atrS = calculateATRSeries(closedBars, 14);
+  const atr14 = atrS.length ? atrS[atrS.length - 1] : quote.mid * 0.002;
+  const macd = calculateMACD(closes);
+  const sq = calculateSqueezeAndBands(closes, atr14);
+  const { regime, danger } = classifyMarketRegimeAndDanger(closedBars, atrS, quote.spread, prof.maxSpreadRatioAtr, sq.squeezeOn);
+  const keyLevels = extractKeyLevels(closedBars, d1Bars, h1Bars, atr14, symbol, quote.mid);
+  const st = analyzeMarketStructure(closedBars, atr14, symbol, prof.bosLookback);
+  const { ob, breaker } = detectOrderAndBreakerBlocks(closedBars, st, symbol);
+  const fvg = analyzeFVGs(closedBars, atr14, symbol);
+  const tr = detectFastAndKeyTriggers(closedBars, keyLevels, atr14, e8, e21, macd, sq, st);
+  const htf =
+    tf === prof.htf
+      ? { bias: e8 > e21 ? 'BULLISH' : 'BEARISH', wB: e8 > e21 ? 15 : 0, wS: e8 < e21 ? 15 : 0, label: `${htfLabel}: SELF` }
+      : evaluateHTFContext(htfBars, htfLabel, symbol);
+
+  let bScore = 0;
+  let bStrat = '';
+  if (tr.squeezeBreakBull) { bScore += 35; bStrat = 'SQUEEZE BREAK'; }
+  if (tr.fastMomentumBull) { bScore += 30; bStrat = bStrat || 'MOMENTUM 8/21'; }
+  if (tr.srBullBounce) { bScore += 30; bStrat = bStrat || 'S/R BOUNCE'; }
+  if (tr.srBreakoutBull || tr.bullBreakRetest) { bScore += 25; bStrat = bStrat || 'S/R BREAKOUT'; }
+  if (tr.paBull) { bScore += 20; bStrat = bStrat || 'PRICE ACTION'; }
+  if (e8 > e21) bScore += 15;
+  if (st.type === 'BULLISH') bScore += 15;
+  if (fvg.retestedBullFvg || ob.type === 'BULLISH' || breaker.type === 'BULLISH') bScore += 10;
+  bScore += htf.wB;
+  if (rsi14 !== null && rsi14 >= 40 && rsi14 < 78) bScore += 10;
+  bScore = Math.max(0, Math.min(100, bScore));
+
+  let sScore = 0;
+  let sStrat = '';
+  if (tr.squeezeBreakBear) { sScore += 35; sStrat = 'SQUEEZE BREAK'; }
+  if (tr.fastMomentumBear) { sScore += 30; sStrat = sStrat || 'MOMENTUM 8/21'; }
+  if (tr.srBearReject) { sScore += 30; sStrat = sStrat || 'S/R REJECT'; }
+  if (tr.srBreakoutBear || tr.bearBreakRetest) { sScore += 25; sStrat = sStrat || 'S/R BREAKOUT'; }
+  if (tr.paBear) { sScore += 20; sStrat = sStrat || 'PRICE ACTION'; }
+  if (e8 < e21) sScore += 15;
+  if (st.type === 'BEARISH') sScore += 15;
+  if (fvg.retestedBearFvg || ob.type === 'BEARISH' || breaker.type === 'BEARISH') sScore += 10;
+  sScore += htf.wS;
+  if (rsi14 !== null && rsi14 <= 60 && rsi14 > 22) sScore += 10;
+  sScore = Math.max(0, Math.min(100, sScore));
+
+  const dom: 'BUY' | 'SELL' = bScore >= sScore ? 'BUY' : 'SELL';
+  const score = Math.max(bScore, sScore);
+  const stratName = (dom === 'BUY' ? bStrat : sStrat) || 'TREND FOLLOW';
+  const r3H = Math.max(...closedBars.slice(-3).map((c) => c.high));
+  const r3L = Math.min(...closedBars.slice(-3).map((c) => c.low));
+
+  const buildLvl = (side: 'BUY' | 'SELL') => {
+    const entry = side === 'BUY' ? quote.ask : quote.bid;
+    const minD = Math.max(atr14 * 1.1, spec.tickSize * 5);
+    const maxReasonableSL = atr14 * 2.1;
+    if (side === 'BUY') {
+      const nearS1 = keyLevels.s1 && entry - keyLevels.s1.price <= maxReasonableSL ? keyLevels.s1.price : null;
+      const base = nearS1 || (st.swingLow && entry - st.swingLow <= maxReasonableSL ? st.swingLow : r3L);
+      const dist = Math.min(maxReasonableSL, Math.max(minD, entry - (base - atr14 * 0.25)));
+      const sl = entry - dist;
+      const tp1 = entry + dist * danger.tp1R;
+      const tp2 = entry + dist * danger.tp2R;
+      const tp3 =
+        keyLevels.r1 && keyLevels.r1.price > tp2
+          ? keyLevels.r1.price
+          : keyLevels.r2 && keyLevels.r2.price > tp2
+          ? keyLevels.r2.price
+          : entry + dist * 2.4;
+      return { entry, sl, tp1, tp2, tp3, dist, entryZone: `${fmtPrice(Math.min(entry, e8), symbol)}–${fmtPrice(entry, symbol)}` };
+    }
+    const nearR1 = keyLevels.r1 && keyLevels.r1.price - entry <= maxReasonableSL ? keyLevels.r1.price : null;
+    const base = nearR1 || (st.swingHigh && st.swingHigh - entry <= maxReasonableSL ? st.swingHigh : r3H);
+    const dist = Math.min(maxReasonableSL, Math.max(minD, base + atr14 * 0.25 - entry));
+    const sl = entry + dist;
+    const tp1 = entry - dist * danger.tp1R;
+    const tp2 = entry - dist * danger.tp2R;
+    const tp3 =
+      keyLevels.s1 && keyLevels.s1.price < tp2
+        ? keyLevels.s1.price
+        : keyLevels.s2 && keyLevels.s2.price < tp2
+        ? keyLevels.s2.price
+        : entry - dist * 2.4;
+    return { entry, sl, tp1, tp2, tp3, dist, entryZone: `${fmtPrice(entry, symbol)}–${fmtPrice(Math.max(entry, e8), symbol)}` };
+  };
+
+  const lv = buildLvl(dom);
+  const rc = computePositionRiskAndCosts(lv.dist, quote, spec, riskConfig, danger.riskScale);
+  const cost = rc.costInPrice || quote.spread;
+  const netR1 = lv.dist + cost > 0 ? Math.max(0, lv.dist * danger.tp1R - cost) / (lv.dist + cost) : 0;
+  const netR2 = lv.dist + cost > 0 ? Math.max(0, lv.dist * danger.tp2R - cost) / (lv.dist + cost) : 0;
+  const riskAdv = !spec.verified
+    ? 'Spec UNVERIFIED'
+    : !rc.valid
+    ? `Advisory: ${rc.reason}`
+    : `Lot ${rc.lots.toFixed(2)} (${(danger.riskScale * 100).toFixed(0)}%)`;
+
+  const fastSignalOk =
+    dom === 'BUY'
+      ? tr.fastMomentumBull || tr.squeezeBreakBull || tr.srBullBounce || tr.srBreakoutBull || tr.bullBreakRetest || tr.paBull
+      : tr.fastMomentumBear || tr.squeezeBreakBear || tr.srBearReject || tr.srBreakoutBear || tr.bearBreakRetest || tr.paBear;
+  const notChased = dom === 'BUY' ? tr.notChasedBull : tr.notChasedBear;
+
+  const rules = [
+    { name: 'Fast Trigger', pass: fastSignalOk, detail: stratName },
+    { name: 'EMA 8/21 + MACD', pass: dom === 'BUY' ? e8 >= e21 || macd.hist >= 0 : e8 <= e21 || macd.hist <= 0, detail: macd.hist >= 0 ? 'Bull Mom' : 'Bear Mom' },
+    { name: 'Squeeze / Regime', pass: regime.regime !== 'LOW_VOL', detail: sq.squeezeOn ? 'Squeeze ON' : regime.regime },
+    { name: 'Anti-Spike Guard', pass: notChased, detail: notChased ? 'Clear' : 'Extreme Spike' },
+    { name: `HTF (${htfLabel})`, pass: (dom === 'BUY' ? htf.wB : htf.wS) > 0, detail: htf.bias },
+    { name: 'S/R Key Levels', pass: Boolean(keyLevels.s1 || keyLevels.r1), detail: keyLevels.s1 && keyLevels.r1 ? 'S1/R1 OK' : 'Partial' },
+    { name: 'Danger Tier', pass: danger.pct < 65, detail: `${danger.pct}%` },
+    { name: 'Net R:R', pass: netR1 >= 0.5, detail: `${netR1.toFixed(2)}R` },
+  ];
+
+  // Only wait when dead chop (ADX < 14 & ER < 0.14 with no trigger) or extreme blow-off spike
+  if (regime.adx < 14 && regime.er < 0.14 && !fastSignalOk) {
+    return mk({
+      state: 'WAIT',
+      type: 'WAIT',
+      danger,
+      regime,
+      keyLevels,
+      setupScore: score,
+      rules,
+      htfSummary: htf.label,
+      ema8: e8,
+      ema21: e21,
+      macdHist: macd.hist,
+      rsi14,
+      atr14,
+      fvg,
+      structure: st,
+      ob,
+      breaker,
+      riskCalc: rc,
+      diagVeto: riskAdv,
+      diagSetup: `Dead Chop (ADX ${regime.adx.toFixed(1)})`,
+      diagTrigger: 'Wait S1/R1 breakout',
+      reason: `WAIT: Dead Flat Market (ADX ${regime.adx.toFixed(1)})`,
+    });
+  }
+
+  if (score >= 40 && fastSignalOk && notChased && netR1 >= 0.5) {
+    const mode = `${stratName}${danger.tier !== 'CLEAN' ? ` (${Math.round(danger.riskScale * 100)}% RISK)` : ''}`;
+    return mk({
+      state: 'READY',
+      type: dom,
+      entryMode: mode,
+      entry: lv.entry,
+      entryZone: lv.entryZone,
+      tp1: lv.tp1,
+      tp2: lv.tp2,
+      tp3: lv.tp3,
+      sl: lv.sl,
+      grossRR: danger.tp1R,
+      netRR: netR1,
+      rrText: `Gross ${danger.tp1R}R/${danger.tp2R}R | Net ${netR1.toFixed(2)}R/${netR2.toFixed(2)}R`,
+      danger,
+      regime,
+      keyLevels,
+      htfSummary: htf.label,
+      setupScore: score,
+      rules,
+      riskCalc: rc,
+      diagVeto: riskAdv,
+      diagSetup: `${dom} ${score}% · ${regime.regime}`,
+      diagTrigger: `${stratName} confirmed`,
+      ema8: e8,
+      ema21: e21,
+      macdHist: macd.hist,
+      rsi14,
+      atr14,
+      fvg,
+      structure: st,
+      ob,
+      breaker,
+      reason: `READY ${dom} (${stratName} · ${score}%)`,
+    });
+  }
+
+  const tgtLvl =
+    dom === 'BUY'
+      ? keyLevels.s1
+        ? fmtPrice(keyLevels.s1.price, symbol)
+        : fmtPrice(e8, symbol)
+      : keyLevels.r1
+      ? fmtPrice(keyLevels.r1.price, symbol)
+      : fmtPrice(e8, symbol);
+
+  const reasonWait = !notChased
+    ? 'Extreme blow-off spike — wait pullback'
+    : !fastSignalOk
+    ? `Bias ${dom} (${score}%) — awaiting fast candle confirmation`
+    : `Net R:R ${netR1.toFixed(2)}R low`;
+
+  return mk({
+    state: score >= 35 ? 'WATCH' : 'WAIT',
+    type: 'WAIT',
+    entryMode: `${dom} BIAS ${score}%`,
+    entryZone: tgtLvl,
+    watchNote: `${dom} BIAS (${score}%) · ${reasonWait}`,
+    danger,
+    regime,
+    keyLevels,
+    htfSummary: htf.label,
+    setupScore: score,
+    rules,
+    riskCalc: rc,
+    grossRR: danger.tp1R,
+    netRR: netR1,
+    rrText: `Est. Net ${netR1.toFixed(2)}R`,
+    diagVeto: riskAdv,
+    diagSetup: `${dom} ${score}% · ${regime.regime}`,
+    diagTrigger: reasonWait,
+    ema8: e8,
+    ema21: e21,
+    macdHist: macd.hist,
+    rsi14,
+    atr14,
+    fvg,
+    structure: st,
+    ob,
+    breaker,
+    reason: `${score >= 35 ? 'WATCH' : 'WAIT'}: ${reasonWait}`,
+  });
+}
+
+export function runWalkForwardForTimeframe(
+  sym: string,
+  tf: TimeframeKey,
+  closedBars: CandleBar[],
+  htfBars: CandleBar[] | null,
+  d1Bars: CandleBar[] | null,
+  h1Bars: CandleBar[] | null,
+  ctx: {
+    provider: ProviderType;
+    riskConfig: RiskConfig;
+    brokerSpecsOverride: BrokerSpecOverrideMap;
+    liveQuote: QuoteData | null;
+    spreadOv?: number | null;
+  },
+  wfCache: Record<string, WalkForwardStats>
+): WalkForwardStats {
+  if (!closedBars || closedBars.length < 75) {
+    return { insufficient: true, reason: `Insufficient data (${closedBars?.length || 0}/75 bars)` };
+  }
+  const lastCt = closedBars[closedBars.length - 1].timeMs;
+  const ck = `${sym}:${tf}:${lastCt}:${ctx.spreadOv ?? 'live'}`;
+  if (wfCache[ck]) return wfCache[ck];
+
+  const prof = TF_PROFILES[tf] || TF_PROFILES.M15;
+  const spec = getSymbolSpec(
+    sym,
+    ctx.provider,
+    closedBars[closedBars.length - 1].close,
+    ctx.riskConfig,
+    ctx.brokerSpecsOverride,
+    ctx.liveQuote?.mid
+  );
+  const tfMs = prof.seconds * 1000;
+  const htfMs = (TF_PROFILES[prof.htf]?.seconds || 3600) * 1000;
+  const d1Ms = 86400 * 1000;
+  const h1Ms = 3600 * 1000;
+  const simSp = ctx.spreadOv != null ? ctx.spreadOv : ctx.liveQuote?.spread || spec.pipSize * 1.5;
+  const slip = spec.slippagePoints * spec.pointSize * 2;
+  const comm = spec.verified && spec.tickValueUsd ? (spec.commissionPerLotUsd || 0) / (spec.tickValueUsd / spec.tickSize) : 0;
+
+  let w = 0,
+    l = 0,
+    open = 0,
+    skip = 0,
+    sW = 0,
+    sL = 0,
+    eq = 0,
+    pk = 0,
+    dd = 0,
+    cs = 0,
+    ms = 0,
+    cd = -1;
+  const startI = Math.max(45, closedBars.length - 155);
+
+  for (let i = startI; i < closedBars.length - 2; i++) {
+    if (i <= cd) continue;
+    const decMs = closedBars[i].timeMs + tfMs;
+    const sLtf = closedBars.slice(Math.max(0, i - 110), i + 1);
+    const sHtf = htfBars ? htfBars.filter((h) => h.timeMs + htfMs <= decMs).slice(-90) : null;
+    const sD1 = d1Bars ? d1Bars.filter((d) => d.timeMs + d1Ms <= decMs).slice(-40) : null;
+    const sH1 = h1Bars ? h1Bars.filter((h) => h.timeMs + h1Ms <= decMs).slice(-80) : null;
+    const exec = closedBars[i + 1].open;
+
+    const stp = evaluateSetup(sym, tf, sLtf, null, sHtf, sD1, sH1, {
+      provider: ctx.provider,
+      riskConfig: ctx.riskConfig,
+      brokerSpecsOverride: ctx.brokerSpecsOverride,
+      liveQuote: ctx.liveQuote,
+      freshness: { available: true, fresh: true, status: 'LIVE', label: 'HISTORICAL' },
+      historicalMode: true,
+      simQuote: { bid: exec - simSp * 0.5, ask: exec + simSp * 0.5, mid: exec, spread: simSp },
+    });
+
+    if (stp.state !== 'READY' || !Number.isFinite(stp.tp1) || !Number.isFinite(stp.sl) || !Number.isFinite(stp.entry) || !Number.isFinite(stp.tp2)) {
+      skip++;
+      continue;
+    }
+
+    const rsk = Math.abs(stp.entry! - stp.sl!) + slip + comm;
+    const r1 = Math.max(0, Math.abs(stp.tp1! - stp.entry!) - slip - comm);
+    const r2 = Math.max(0, Math.abs(stp.tp2! - stp.entry!) - slip - comm);
+    let out: 'WIN' | 'LOSS' | 'OPEN' = 'OPEN';
+    let rr = 0;
+    let ri = i + 1;
+
+    for (let k = i + 1; k < Math.min(closedBars.length, i + 45); k++) {
+      const b = closedBars[k];
+      ri = k;
+      if (stp.type === 'BUY') {
+        if (b.low <= stp.sl!) { out = 'LOSS'; rr = -1; break; }
+        if (b.high >= stp.tp2!) { out = 'WIN'; rr = r2 / rsk; break; }
+        if (b.high >= stp.tp1!) { out = 'WIN'; rr = r1 / rsk; break; }
+      } else {
+        if (b.high >= stp.sl!) { out = 'LOSS'; rr = -1; break; }
+        if (b.low <= stp.tp2!) { out = 'WIN'; rr = r2 / rsk; break; }
+        if (b.low <= stp.tp1!) { out = 'WIN'; rr = r1 / rsk; break; }
+      }
+    }
+
+    cd = ri + prof.cooldownBars;
+    if (out === 'WIN') {
+      w++;
+      sW += rr;
+      eq += rr;
+      cs = 0;
+    } else if (out === 'LOSS') {
+      l++;
+      sL += 1;
+      eq -= 1;
+      cs++;
+      ms = Math.max(ms, cs);
+    } else {
+      open++;
+    }
+    pk = Math.max(pk, eq);
+    dd = Math.max(dd, pk - eq);
+  }
+
+  const tot = w + l;
+  const res: WalkForwardStats = {
+    insufficient: false,
+    symbol: sym,
+    tf,
+    totalTrades: tot,
+    wins: w,
+    losses: l,
+    openOrExpired: open,
+    skippedSetups: skip,
+    winRate: tot > 0 ? (w / tot) * 100 : null,
+    profitFactor: sL > 0 ? sW / sL : sW > 0 ? 9.99 : 0,
+    netRR: l > 0 && w > 0 ? sW / w / (sL / l) : w > 0 ? sW / w : 0,
+    maxDrawdownR: dd,
+    avgWinR: w > 0 ? sW / w : 0,
+    avgLossR: l > 0 ? sL / l : 0,
+    expectancyR: tot > 0 ? eq / tot : 0,
+    maxLossStreak: ms,
+  };
+  wfCache[ck] = res;
+  return res;
+}
