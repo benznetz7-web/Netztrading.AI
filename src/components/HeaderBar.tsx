@@ -45,8 +45,8 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
     statusLevel === 'ok' ? 'text-emerald-400' : statusLevel === 'err' ? 'text-red-400' : 'text-amber-400';
 
   return (
-    <header className="sticky top-0 z-40 border-b border-[#1e2535] bg-[#121620]/95 backdrop-blur-md">
-      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2.5 px-3.5 py-2.5">
+    <header className="border-b border-[#1e2535] bg-[#121620]/95 backdrop-blur-md sm:sticky sm:top-0 sm:z-40">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-3 py-2 sm:gap-2.5 sm:px-3.5 sm:py-2.5">
         <div className="flex items-center gap-2.5">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-tr from-amber-500 to-yellow-300 text-slate-950 shadow-sm">
             <Crown className="h-4 w-4 stroke-[2.5]" />

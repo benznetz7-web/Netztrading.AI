@@ -8,6 +8,7 @@ import {
   classifyMarketRegimeAndDanger,
   computePositionRiskAndCosts,
   detectConfirmedSwings,
+  detectSRReversal,
   evaluateSetup,
   extractKeyLevels,
   getSymbolSpec,
@@ -41,7 +42,7 @@ export async function executeFullQaSuite(
   signalRState: string,
   onLog: (entry: QaLogEntry) => void
 ): Promise<void> {
-  onLog({ text: `Running ${APP_VERSION} 20-Test QA Suite…`, status: 'info' });
+  onLog({ text: `Running ${APP_VERSION} 21-Test QA Suite…`, status: 'info' });
 
   const mockQuotes: QuotesByProvider = { BIQUOTE: {}, EXNESS: {} };
   const defaultRisk: RiskConfig = { balance: 80, riskPercent: 0.5, dailyCap: 1.0, contractMode: 'STANDARD', commission: 0 };
@@ -191,7 +192,7 @@ export async function executeFullQaSuite(
       },
     ],
     [
-      '12. Stale M1 (>25s) & M5 (>60s) quotes rejected',
+      '12. Stale M1 (>45s) & M5 (>70s) quotes rejected',
       () => {
         const old = new Date(Date.now() - 75000).toISOString();
         delete mockQuotes.BIQUOTE.XAUUSD;
@@ -309,6 +310,26 @@ export async function executeFullQaSuite(
         );
         assert(!wf.insufficient && Number.isFinite(wf.profitFactor), 'WF failed');
         return `${wf.totalTrades} trades, PF=${wf.profitFactor!.toFixed(2)}`;
+      },
+    ],
+    [
+      '21. Reversal at Resistance/Support (R1/S1) fires before pullback to Entry',
+      () => {
+        const b = makeSynBars(Array.from({ length: 35 }, (_, i) => 3580 + i * 0.5), 1.0);
+        // Last bar spikes into R1 (~3610) and leaves a sharp rejection upper wick closing red
+        b[b.length - 1] = { timeMs: b[b.length - 1].timeMs, open: 3606, high: 3611.2, low: 3597, close: 3598, isOpen: false };
+        const kl = {
+          r1: { price: 3610, touches: 3, weight: 8, tags: 'Pivot' },
+          r2: { price: 3620, touches: 2, weight: 6, tags: 'PDH' },
+          s1: { price: 3575, touches: 2, weight: 6, tags: 'Pivot' },
+          s2: null,
+          pdh: 3620,
+          pdl: 3570,
+          all: [],
+        };
+        const rev = detectSRReversal(b, null, 3598.5, kl, 4.0, 68, 'XAUUSD');
+        assert(rev.active && rev.side === 'SELL' && rev.zoneName === 'R1', `Expected SELL reversal at R1, got ${JSON.stringify(rev)}`);
+        return rev.reason;
       },
     ],
   ];

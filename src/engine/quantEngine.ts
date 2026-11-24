@@ -15,6 +15,7 @@ import type {
   RiskCalcResult,
   RiskConfig,
   SignalOutput,
+  SRReversalInfo,
   SymbolSpec,
   TimeframeKey,
   WalkForwardStats,
@@ -274,55 +275,127 @@ export function extractKeyLevels(
   refPrice: number
 ): KeyLevels {
   const spec = SYMBOL_SPECS[sym] || { roundStep: 10 };
-  const rawLevels: Array<{ price: number; tag: string; weight: number }> = [];
-  const add = (price: number | null | undefined, tag: string, weight: number) => {
+  const bars = closedBars.slice(-140);
+  const tol = Math.max(refPrice * 0.0009, (atr || refPrice * 0.002) * 0.40);
+  const minGap = Math.max(tol * 1.4, refPrice * 0.0008);
+
+  type RawCand = { price: number; side: 'R' | 'S' | 'BOTH'; tag: string; weight: number };
+  const rawLevels: RawCand[] = [];
+  const add = (price: number | null | undefined, side: 'R' | 'S' | 'BOTH', tag: string, weight: number) => {
     if (typeof price === 'number' && Number.isFinite(price) && price > 0) {
-      rawLevels.push({ price, tag, weight });
+      rawLevels.push({ price, side, tag, weight });
     }
   };
 
-  const { swingHighs, swingLows, eqHigh, eqLow } = detectConfirmedSwings(closedBars.slice(-120), atr);
-  swingHighs.slice(-10).forEach((s) => add(s.price, 'Swing', 2));
-  swingLows.slice(-10).forEach((s) => add(s.price, 'Swing', 2));
-  if (eqHigh) add(eqHigh, 'EQH', 3);
-  if (eqLow) add(eqLow, 'EQL', 3);
+  // 1. Confirmed 3-bar left/right fractal pivots on current timeframe (true structural peaks/valleys)
+  for (let i = 3; i < bars.length - 3; i++) {
+    const h = bars[i].high;
+    const l = bars[i].low;
+    const isPeak =
+      h >= bars[i - 1].high && h >= bars[i - 2].high && h > bars[i - 3].high &&
+      h >= bars[i + 1].high && h >= bars[i + 2].high && h > bars[i + 3].high;
+    const isTrough =
+      l <= bars[i - 1].low && l <= bars[i - 2].low && l < bars[i - 3].low &&
+      l <= bars[i + 1].low && l <= bars[i + 2].low && l < bars[i + 3].low;
+    if (isPeak) add(h, h > refPrice ? 'R' : 'S', 'Pivot', 3);
+    if (isTrough) add(l, l < refPrice ? 'S' : 'R', 'Pivot', 3);
+  }
 
+  // Fallback to 1-bar confirmed swings if bars are short or sawtooth (e.g. unit test fixtures)
+  const { swingHighs, swingLows, eqHigh, eqLow } = detectConfirmedSwings(bars, atr);
+  swingHighs.slice(-8).forEach((s) => add(s.price, s.price > refPrice ? 'R' : 'S', 'Swing', 2));
+  swingLows.slice(-8).forEach((s) => add(s.price, s.price < refPrice ? 'S' : 'R', 'Swing', 2));
+  if (eqHigh) add(eqHigh, eqHigh > refPrice ? 'R' : 'S', 'EQH', 4);
+  if (eqLow) add(eqLow, eqLow < refPrice ? 'S' : 'R', 'EQL', 4);
+
+  // 2. Previous Day High / Low (major institutional liquidity magnets)
   let pdh: number | null = null;
   let pdl: number | null = null;
   if (d1Bars && d1Bars.length >= 1) {
     const prevD = d1Bars[d1Bars.length - 1];
     pdh = prevD.high;
     pdl = prevD.low;
-    add(pdh, 'PDH', 4);
-    add(pdl, 'PDL', 4);
+    add(pdh, pdh >= refPrice ? 'R' : 'S', 'PDH', 5);
+    add(pdl, pdl <= refPrice ? 'S' : 'R', 'PDL', 5);
   }
+
+  // 3. H1 Major Fractal Swings
   if (h1Bars && h1Bars.length >= 20) {
-    const hSw = detectConfirmedSwings(h1Bars.slice(-60), atr);
-    hSw.swingHighs.slice(-4).forEach((s) => add(s.price, 'H1', 3));
-    hSw.swingLows.slice(-4).forEach((s) => add(s.price, 'H1', 3));
+    const hSw = detectConfirmedSwings(h1Bars.slice(-80), atr);
+    hSw.swingHighs.slice(-6).forEach((s) => add(s.price, s.price > refPrice ? 'R' : 'S', 'H1', 4));
+    hSw.swingLows.slice(-6).forEach((s) => add(s.price, s.price < refPrice ? 'S' : 'R', 'H1', 4));
   }
 
-  const step = spec.roundStep || 10;
-  const baseR = Math.round(refPrice / step) * step;
-  [-2, -1, 0, 1, 2].forEach((k) => add(baseR + k * step, 'Round', 1));
-
-  const tol = Math.max(refPrice * 0.0012, (atr || refPrice * 0.002) * 0.45);
-  const clusters: Array<{ price: number; touches: number; weight: number; tags: Set<string> }> = [];
-  for (const lvl of rawLevels.sort((a, b) => a.price - b.price)) {
+  // Cluster WITHOUT diluting exact structural anchor price by round numbers
+  const clusters: Array<{ price: number; anchorWeight: number; touches: number; weight: number; tags: Set<string>; side: 'R' | 'S' | 'BOTH' }> = [];
+  for (const lvl of rawLevels.sort((a, b) => b.weight - a.weight)) {
     const match = clusters.find((c) => Math.abs(c.price - lvl.price) <= tol);
     if (match) {
-      match.touches++;
       match.weight += lvl.weight;
       match.tags.add(lvl.tag);
-      match.price = (match.price * (match.touches - 1) + lvl.price) / match.touches;
+      if (lvl.weight > match.anchorWeight) {
+        match.price = lvl.price;
+        match.anchorWeight = lvl.weight;
+      }
+      if (match.side !== lvl.side) match.side = 'BOTH';
     } else {
-      clusters.push({ price: lvl.price, touches: 1, weight: lvl.weight, tags: new Set([lvl.tag]) });
+      clusters.push({
+        price: lvl.price,
+        anchorWeight: lvl.weight,
+        touches: 0,
+        weight: lvl.weight,
+        tags: new Set([lvl.tag]),
+        side: lvl.side,
+      });
     }
   }
 
-  const minGap = Math.max(tol * 1.2, refPrice * 0.0008);
-  const above = clusters.filter((c) => c.price > refPrice + minGap * 0.25).sort((a, b) => a.price - b.price);
-  const below = clusters.filter((c) => c.price < refPrice - minGap * 0.25).sort((a, b) => b.price - a.price);
+  // Count real historical bar reaction touches near each cluster
+  const touchTol = Math.max(tol * 0.65, refPrice * 0.0004);
+  for (const c of clusters) {
+    let reactions = 0;
+    let lastTouchIdx = -3;
+    for (let i = 0; i < bars.length; i++) {
+      const b = bars[i];
+      const testedHigh = Math.abs(b.high - c.price) <= touchTol;
+      const testedLow = Math.abs(b.low - c.price) <= touchTol;
+      if ((testedHigh || testedLow) && i - lastTouchIdx >= 2) {
+        reactions++;
+        lastTouchIdx = i;
+      }
+    }
+    c.touches = Math.max(1, reactions);
+    c.weight += Math.min(6, reactions);
+  }
+
+  // Add psychological round numbers ONLY if structural levels above/below are sparse
+  const aboveStruct = clusters.filter((c) => c.price > refPrice + minGap * 0.25);
+  const belowStruct = clusters.filter((c) => c.price < refPrice - minGap * 0.25);
+  if (aboveStruct.length < 2 || belowStruct.length < 2) {
+    const step = spec.roundStep || 10;
+    const baseR = Math.round(refPrice / step) * step;
+    [-2, -1, 1, 2].forEach((k) => {
+      const p = baseR + k * step;
+      if (!clusters.some((c) => Math.abs(c.price - p) <= tol)) {
+        clusters.push({
+          price: p,
+          anchorWeight: 1,
+          touches: 1,
+          weight: 1,
+          tags: new Set(['Round']),
+          side: p > refPrice ? 'R' : 'S',
+        });
+      }
+    });
+  }
+
+  const above = clusters
+    .filter((c) => c.price > refPrice + minGap * 0.20)
+    .sort((a, b) => a.price - b.price);
+  const below = clusters
+    .filter((c) => c.price < refPrice - minGap * 0.20)
+    .sort((a, b) => b.price - a.price);
+
   const r1 = above[0] || null;
   const r2 = above.find((c) => !r1 || c.price - r1.price >= minGap) || above[1] || null;
   const s1 = below[0] || null;
@@ -331,7 +404,93 @@ export function extractKeyLevels(
   const fmtC = (c: typeof clusters[number] | null): KeyLevelPoint | null =>
     c ? { price: c.price, touches: c.touches, weight: c.weight, tags: [...c.tags].slice(0, 2).join('+') } : null;
 
-  return { r1: fmtC(r1), r2: fmtC(r2), s1: fmtC(s1), s2: fmtC(s2), pdh, pdl, eqHigh, eqLow, all: clusters.slice(0, 10) };
+  return {
+    r1: fmtC(r1),
+    r2: fmtC(r2),
+    s1: fmtC(s1),
+    s2: fmtC(s2),
+    pdh,
+    pdl,
+    eqHigh,
+    eqLow,
+    all: clusters.sort((a, b) => b.weight - a.weight).slice(0, 10),
+  };
+}
+
+export function detectSRReversal(
+  closedBars: CandleBar[],
+  formingBar: CandleBar | null,
+  liveMid: number,
+  keyLevels: KeyLevels,
+  atr: number,
+  rsi14: number | null,
+  sym: string
+): SRReversalInfo {
+  const empty: SRReversalInfo = { active: false, side: 'NONE', zoneName: '', zonePrice: null, reason: '' };
+  if (closedBars.length < 3 || !(atr > 0)) return empty;
+
+  const last = closedBars[closedBars.length - 1];
+  const prev = closedBars[closedBars.length - 2];
+  const curBar = formingBar || last;
+  const tol = Math.max(atr * 0.60, liveMid * 0.0005);
+
+  const checkBearReject = (bar: CandleBar, prior: CandleBar) => {
+    const rng = Math.max(1e-9, bar.high - bar.low);
+    const body = Math.abs(bar.close - bar.open);
+    const upperWick = bar.high - Math.max(bar.open, bar.close);
+    const bearEngulf = bar.close < bar.open && prior.close > prior.open && bar.close <= prior.open;
+    const upperReject = upperWick >= Math.max(body * 1.15, rng * 0.36);
+    const bearTurn = bar.close < bar.open && body >= rng * 0.28;
+    return bearEngulf || upperReject || (bearTurn && (rsi14 === null || rsi14 >= 56));
+  };
+
+  const checkBullBounce = (bar: CandleBar, prior: CandleBar) => {
+    const rng = Math.max(1e-9, bar.high - bar.low);
+    const body = Math.abs(bar.close - bar.open);
+    const lowerWick = Math.min(bar.open, bar.close) - bar.low;
+    const bullEngulf = bar.close > bar.open && prior.close < prior.open && bar.close >= prior.open;
+    const lowerReject = lowerWick >= Math.max(body * 1.15, rng * 0.36);
+    const bullTurn = bar.close > bar.open && body >= rng * 0.28;
+    return bullEngulf || lowerReject || (bullTurn && (rsi14 === null || rsi14 <= 44));
+  };
+
+  const resZones: Array<{ name: string; price: number }> = [];
+  if (keyLevels.r1) resZones.push({ name: 'R1', price: keyLevels.r1.price });
+  if (keyLevels.pdh) resZones.push({ name: 'PDH', price: keyLevels.pdh });
+  if (keyLevels.r2) resZones.push({ name: 'R2', price: keyLevels.r2.price });
+
+  for (const rz of resZones) {
+    const touchedRes = Math.max(last.high, curBar.high) >= rz.price - tol && liveMid <= rz.price + tol * 0.6;
+    if (touchedRes && (checkBearReject(last, prev) || (formingBar && checkBearReject(formingBar, last)))) {
+      return {
+        active: true,
+        side: 'SELL',
+        zoneName: rz.name,
+        zonePrice: rz.price,
+        reason: `Reversal at ${rz.name} (${fmtPrice(rz.price, sym)})`,
+      };
+    }
+  }
+
+  const supZones: Array<{ name: string; price: number }> = [];
+  if (keyLevels.s1) supZones.push({ name: 'S1', price: keyLevels.s1.price });
+  if (keyLevels.pdl) supZones.push({ name: 'PDL', price: keyLevels.pdl });
+  if (keyLevels.s2) supZones.push({ name: 'S2', price: keyLevels.s2.price });
+
+  for (const sz of supZones) {
+    const touchedSup = Math.min(last.low, curBar.low) <= sz.price + tol && liveMid >= sz.price - tol * 0.6;
+    if (touchedSup && (checkBullBounce(last, prev) || (formingBar && checkBullBounce(formingBar, last)))) {
+      return {
+        active: true,
+        side: 'BUY',
+        zoneName: sz.name,
+        zonePrice: sz.price,
+        reason: `Reversal at ${sz.name} (${fmtPrice(sz.price, sym)})`,
+      };
+    }
+  }
+
+  return empty;
 }
 
 export function analyzeMarketStructure(c: CandleBar[], atr: number, sym: string, bosLookback = 18): MarketStructure {
@@ -683,6 +842,7 @@ export function evaluateSetup(
   const { ob, breaker } = detectOrderAndBreakerBlocks(closedBars, st, symbol);
   const fvg = analyzeFVGs(closedBars, atr14, symbol);
   const tr = detectFastAndKeyTriggers(closedBars, keyLevels, atr14, e8, e21, macd, sq, st);
+  const srRev = detectSRReversal(closedBars, formingBar, quote.mid, keyLevels, atr14, rsi14, symbol);
   const htf =
     tf === prof.htf
       ? { bias: e8 > e21 ? 'BULLISH' : 'BEARISH', wB: e8 > e21 ? 15 : 0, wS: e8 < e21 ? 15 : 0, label: `${htfLabel}: SELF` }
@@ -690,7 +850,8 @@ export function evaluateSetup(
 
   let bScore = 0;
   let bStrat = '';
-  if (tr.squeezeBreakBull) { bScore += 35; bStrat = 'SQUEEZE BREAK'; }
+  if (srRev.active && srRev.side === 'BUY') { bScore += 35; bStrat = `REVERSAL AT ${srRev.zoneName}`; }
+  if (tr.squeezeBreakBull) { bScore += 35; bStrat = bStrat || 'SQUEEZE BREAK'; }
   if (tr.fastMomentumBull) { bScore += 30; bStrat = bStrat || 'MOMENTUM 8/21'; }
   if (tr.srBullBounce) { bScore += 30; bStrat = bStrat || 'S/R BOUNCE'; }
   if (tr.srBreakoutBull || tr.bullBreakRetest) { bScore += 25; bStrat = bStrat || 'S/R BREAKOUT'; }
@@ -704,7 +865,8 @@ export function evaluateSetup(
 
   let sScore = 0;
   let sStrat = '';
-  if (tr.squeezeBreakBear) { sScore += 35; sStrat = 'SQUEEZE BREAK'; }
+  if (srRev.active && srRev.side === 'SELL') { sScore += 35; sStrat = `REVERSAL AT ${srRev.zoneName}`; }
+  if (tr.squeezeBreakBear) { sScore += 35; sStrat = sStrat || 'SQUEEZE BREAK'; }
   if (tr.fastMomentumBear) { sScore += 30; sStrat = sStrat || 'MOMENTUM 8/21'; }
   if (tr.srBearReject) { sScore += 30; sStrat = sStrat || 'S/R REJECT'; }
   if (tr.srBreakoutBear || tr.bearBreakRetest) { sScore += 25; sStrat = sStrat || 'S/R BREAKOUT'; }
@@ -769,8 +931,8 @@ export function evaluateSetup(
 
   const fastSignalOk =
     dom === 'BUY'
-      ? tr.fastMomentumBull || tr.squeezeBreakBull || tr.srBullBounce || tr.srBreakoutBull || tr.bullBreakRetest || tr.paBull
-      : tr.fastMomentumBear || tr.squeezeBreakBear || tr.srBearReject || tr.srBreakoutBear || tr.bearBreakRetest || tr.paBear;
+      ? (srRev.active && srRev.side === 'BUY') || tr.fastMomentumBull || tr.squeezeBreakBull || tr.srBullBounce || tr.srBreakoutBull || tr.bullBreakRetest || tr.paBull
+      : (srRev.active && srRev.side === 'SELL') || tr.fastMomentumBear || tr.squeezeBreakBear || tr.srBearReject || tr.srBreakoutBear || tr.bearBreakRetest || tr.paBear;
   const notChased = dom === 'BUY' ? tr.notChasedBull : tr.notChasedBear;
 
   const rules = [
@@ -779,7 +941,7 @@ export function evaluateSetup(
     { name: 'Squeeze / Regime', pass: regime.regime !== 'LOW_VOL', detail: sq.squeezeOn ? 'Squeeze ON' : regime.regime },
     { name: 'Anti-Spike Guard', pass: notChased, detail: notChased ? 'Clear' : 'Extreme Spike' },
     { name: `HTF (${htfLabel})`, pass: (dom === 'BUY' ? htf.wB : htf.wS) > 0, detail: htf.bias },
-    { name: 'S/R Key Levels', pass: Boolean(keyLevels.s1 || keyLevels.r1), detail: keyLevels.s1 && keyLevels.r1 ? 'S1/R1 OK' : 'Partial' },
+    { name: 'S/R Key Levels', pass: Boolean(keyLevels.s1 || keyLevels.r1), detail: srRev.active ? srRev.reason : keyLevels.s1 && keyLevels.r1 ? 'S1/R1 OK' : 'Partial' },
     { name: 'Danger Tier', pass: danger.pct < 65, detail: `${danger.pct}%` },
     { name: 'Net R:R', pass: netR1 >= 0.5, detail: `${netR1.toFixed(2)}R` },
   ];
@@ -805,6 +967,8 @@ export function evaluateSetup(
       ob,
       breaker,
       riskCalc: rc,
+      reversalInfo: srRev,
+      reversalWarning: srRev.active,
       diagVeto: riskAdv,
       diagSetup: `Dead Chop (ADX ${regime.adx.toFixed(1)})`,
       diagTrigger: 'Wait S1/R1 breakout',
@@ -834,6 +998,8 @@ export function evaluateSetup(
       setupScore: score,
       rules,
       riskCalc: rc,
+      reversalInfo: srRev,
+      reversalWarning: srRev.active && srRev.side !== dom,
       diagVeto: riskAdv,
       diagSetup: `${dom} ${score}% · ${regime.regime}`,
       diagTrigger: `${stratName} confirmed`,
@@ -870,7 +1036,7 @@ export function evaluateSetup(
     type: 'WAIT',
     entryMode: `${dom} BIAS ${score}%`,
     entryZone: tgtLvl,
-    watchNote: `${dom} BIAS (${score}%) · ${reasonWait}`,
+    watchNote: srRev.active ? srRev.reason : `${dom} BIAS (${score}%) · ${reasonWait}`,
     danger,
     regime,
     keyLevels,
@@ -878,6 +1044,8 @@ export function evaluateSetup(
     setupScore: score,
     rules,
     riskCalc: rc,
+    reversalInfo: srRev,
+    reversalWarning: srRev.active,
     grossRR: danger.tp1R,
     netRR: netR1,
     rrText: `Est. Net ${netR1.toFixed(2)}R`,

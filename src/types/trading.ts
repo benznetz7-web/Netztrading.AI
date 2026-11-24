@@ -194,6 +194,28 @@ export interface RuleCheckItem {
   detail: string;
 }
 
+export interface SRReversalInfo {
+  active: boolean;
+  side: 'BUY' | 'SELL' | 'NONE';
+  zoneName: string;
+  zonePrice: number | null;
+  reason: string;
+}
+
+export interface AiAnalysisResult {
+  symbol: string;
+  tf: TimeframeKey;
+  bias: 'BUY' | 'SELL' | 'WAIT';
+  confidence: number;
+  setupType: string;
+  srVerdict: string;
+  reversalAlert: string;
+  entryPlan: string;
+  riskNote: string;
+  summary: string;
+  analyzedAt: string;
+}
+
 export interface SignalOutput {
   asset: string;
   tf: TimeframeKey;
@@ -232,6 +254,7 @@ export interface SignalOutput {
   riskCalc: RiskCalcResult | null;
   locked: boolean;
   reversalWarning: boolean;
+  reversalInfo?: SRReversalInfo;
   tp1Hit: boolean;
   tp2Hit: boolean;
   closedCount: number;

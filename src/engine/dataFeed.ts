@@ -19,22 +19,33 @@ export type QuotesByProvider = Record<ProviderType, Record<string, QuoteData>>;
 
 let rateLimitUntilMs = 0;
 
-export function safeFetch(url: string, opt: RequestInit = {}, ms = 10000): Promise<Response> {
+export function safeFetch(url: string, opt: RequestInit = {}, ms = 15000): Promise<Response> {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), ms);
   return fetch(url, { ...opt, signal: c.signal }).finally(() => clearTimeout(t));
 }
 
-export async function biquoteFetchJson(url: string): Promise<any> {
+export async function biquoteFetchJson(url: string, retries = 1): Promise<any> {
   if (Date.now() < rateLimitUntilMs) throw new Error('Rate limited (429)');
-  const r = await safeFetch(url);
-  if (r.status === 429) {
-    const ra = Number(r.headers.get('Retry-After') || '15');
-    rateLimitUntilMs = Date.now() + Math.max(5, ra) * 1000;
-    throw new Error(`HTTP 429 retry in ${ra}s`);
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await safeFetch(url, {}, 15000);
+      if (r.status === 429) {
+        const ra = Number(r.headers.get('Retry-After') || '15');
+        rateLimitUntilMs = Date.now() + Math.max(5, ra) * 1000;
+        throw new Error(`HTTP 429 retry in ${ra}s`);
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (err: any) {
+      lastErr = err;
+      const msg = String(err?.message || err || '');
+      if (msg.includes('HTTP 429') || attempt >= retries) break;
+      await new Promise((res) => setTimeout(res, 450));
+    }
   }
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr || 'Network error'));
 }
 
 export function ingestQuoteUpdate(

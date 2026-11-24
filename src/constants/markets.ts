@@ -24,8 +24,8 @@ export const BIQUOTE_BASE = 'https://biquote.io';
 export const BIQUOTE_HUB = 'https://biquote.io/hubs/tick';
 
 export const FRESHNESS_LIMITS_SEC: Record<TimeframeKey, number> = {
-  M1: 25,
-  M5: 60,
+  M1: 45,
+  M5: 70,
   M15: 150,
   M30: 240,
   H1: 360,

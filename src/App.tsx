@@ -14,6 +14,7 @@ import {
   Shield,
   Zap,
 } from 'lucide-react';
+import { AiAnalystCard } from './components/AiAnalystCard';
 import { HeaderBar } from './components/HeaderBar';
 import { QaModal } from './components/QaModal';
 import { TradingChart } from './components/TradingChart';
@@ -48,6 +49,7 @@ import {
 } from './engine/quantEngine';
 import type {
   ActiveLock,
+  AiAnalysisResult,
   CandleBar,
   CandleBundle,
   ChartLayers,
@@ -206,6 +208,11 @@ export default function App() {
   const [qaLogs, setQaLogs] = useState<QaLogEntry[]>([]);
   const [qaRunning, setQaRunning] = useState<boolean>(false);
 
+  const [aiAnalysis, setAiAnalysis] = useState<AiAnalysisResult | null>(null);
+  const [aiLoading, setAiLoading] = useState<boolean>(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [autoAi, setAutoAi] = useState<boolean>(true);
+
   // Mutable high-frequency refs (zero stale closures, zero wasted DOM churn)
   const quotesRef = useRef<QuotesByProvider>({ BIQUOTE: {}, EXNESS: {} });
   const brokerSpecsOverrideRef = useRef<BrokerSpecOverrideMap>({});
@@ -226,6 +233,9 @@ export default function App() {
   const pendingWfTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const candleRetryTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const aiAbortRef = useRef<AbortController | null>(null);
+  const aiDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastAiDispatchRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
 
   const signalRConnRef = useRef<signalR.HubConnection | null>(null);
   const signalRStateRef = useRef<string>('DISCONNECTED');
@@ -237,6 +247,8 @@ export default function App() {
     provider,
     activeSymbol,
     currentTF,
+    lang,
+    autoAi,
     alertEnabled,
     riskConfig,
     riskLedger,
@@ -246,6 +258,8 @@ export default function App() {
     provider,
     activeSymbol,
     currentTF,
+    lang,
+    autoAi,
     alertEnabled,
     riskConfig,
     riskLedger,
@@ -449,7 +463,9 @@ export default function App() {
         const px = liveQuote ? (activeLock.type === 'BUY' ? liveQuote.bid : liveQuote.ask) : null;
         const slDist = Math.abs(activeLock.entry - activeLock.sl);
         const adverseMove = px ? (activeLock.type === 'BUY' ? activeLock.entry - px : px - activeLock.entry) : 0;
+        const srOppositeRev = Boolean(fresh.reversalInfo?.active && fresh.reversalInfo.side !== activeLock.type);
         const revWarn =
+          srOppositeRev ||
           (slDist > 0 && adverseMove >= slDist * 0.55 && !activeLock.tp1Hit) ||
           (activeLock.type === 'BUY' && fresh.ema8 !== null && fresh.ema21 !== null && fresh.ema8 < fresh.ema21) ||
           (activeLock.type === 'SELL' && fresh.ema8 !== null && fresh.ema21 !== null && fresh.ema8 > fresh.ema21);
@@ -475,10 +491,13 @@ export default function App() {
           riskCalc: activeLock.riskCalc ?? fresh.riskCalc,
           locked: true,
           reversalWarning: revWarn,
+          reversalInfo: fresh.reversalInfo,
           tp1Hit: activeLock.tp1Hit,
           tp2Hit: Boolean(activeLock.tp2Hit),
-          watchNote: revWarn
-            ? `⚠ Market pulling back against ${activeLock.type} (${fmtPrice(adverseMove, sym)} move) — watch SL or Close/Unlock`
+          watchNote: srOppositeRev
+            ? `⚠ ${fresh.reversalInfo!.reason} — consider partial TP or Close/Unlock before pullback`
+            : revWarn
+            ? `⚠ Market pulling back against ${activeLock.type} (${fmtPrice(Math.max(0, adverseMove), sym)} move) — watch SL or Close/Unlock`
             : null,
           reason: `LOCKED ${activeLock.type} (${activeLock.tp1Hit ? 'TP1 hit' : 'tracking TP1/SL'})`,
         };
@@ -511,8 +530,113 @@ export default function App() {
           setWalkForwardStats(wf);
         }, 25);
       }
+      return finalSig;
     },
     [closeActiveLock, saveLocks, showToast]
+  );
+
+  const runAiAnalysis = useCallback(async (force = false, sigOverride?: SignalOutput) => {
+    const prov = stateRef.current.provider;
+    const sig = sigOverride || stateRef.current.currentSignal;
+    const sym = sig.asset || stateRef.current.activeSymbol;
+    const tf = sig.tf || stateRef.current.currentTF;
+    const lng = stateRef.current.lang;
+    const quote = quotesRef.current[prov]?.[sym];
+    const bundle = candlesCacheRef.current[`${prov}:${sym}:${tf}`];
+
+    if (!quote || !bundle || bundle.closedBars.length < 10) return;
+
+    const dispatchKey = `${sym}:${tf}:${lng}:${sig.candleTime}:${sig.state}:${sig.reversalInfo?.active ? sig.reversalInfo.zoneName : 'none'}`;
+    const now = Date.now();
+    if (!force && lastAiDispatchRef.current.key === dispatchKey && now - lastAiDispatchRef.current.at < 20000) {
+      return;
+    }
+
+    lastAiDispatchRef.current = { key: dispatchKey, at: now };
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort();
+    }
+    const ctrl = new AbortController();
+    aiAbortRef.current = ctrl;
+    setAiLoading(true);
+    setAiError(null);
+
+    try {
+      const res = await fetch('/api/ai-analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          symbol: sym,
+          tf,
+          lang: lng,
+          quote: {
+            bid: quote.bid,
+            ask: quote.ask,
+            mid: quote.mid,
+            spread: quote.spread,
+          },
+          quantSignal: {
+            state: sig.state,
+            type: sig.type,
+            entryMode: sig.entryMode,
+            setupScore: sig.setupScore,
+            entry: sig.entry,
+            sl: sig.sl,
+            tp1: sig.tp1,
+            tp2: sig.tp2,
+            tp3: sig.tp3,
+            regime: sig.regime.regime,
+            ema8: sig.ema8,
+            ema21: sig.ema21,
+            macdHist: sig.macdHist,
+            rsi14: sig.rsi14,
+            atr14: sig.atr14,
+            structure: sig.structure.label,
+            reversalWarning: sig.reversalWarning,
+            reversalReason: sig.reversalInfo?.active ? sig.reversalInfo.reason : null,
+          },
+          keyLevels: {
+            r1: sig.keyLevels.r1?.price ?? null,
+            r2: sig.keyLevels.r2?.price ?? null,
+            s1: sig.keyLevels.s1?.price ?? null,
+            s2: sig.keyLevels.s2?.price ?? null,
+            pdh: sig.keyLevels.pdh ?? null,
+            pdl: sig.keyLevels.pdl ?? null,
+          },
+          recentCandles: bundle.closedBars.slice(-24).map((b) => ({
+            t: b.openTime || new Date(b.timeMs).toISOString(),
+            o: b.open,
+            h: b.high,
+            l: b.low,
+            c: b.close,
+          })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      if (!ctrl.signal.aborted) {
+        setAiAnalysis(data as AiAnalysisResult);
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || ctrl.signal.aborted) return;
+      setAiError(err?.message || 'AI analysis unavailable');
+    } finally {
+      if (aiAbortRef.current === ctrl) {
+        setAiLoading(false);
+      }
+    }
+  }, []);
+
+  const scheduleAutoAi = useCallback(
+    (sig: SignalOutput) => {
+      if (!stateRef.current.autoAi) return;
+      if (aiDebounceTimerRef.current) clearTimeout(aiDebounceTimerRef.current);
+      aiDebounceTimerRef.current = setTimeout(() => {
+        runAiAnalysis(false, sig);
+      }, 650);
+    },
+    [runAiAnalysis]
   );
 
   const analyzeActiveMarket = useCallback(
@@ -529,20 +653,18 @@ export default function App() {
       const tf = overrideTf ?? stateRef.current.currentTF;
       const prov = overrideProv ?? stateRef.current.provider;
       const prof = TF_PROFILES[tf];
+      const cacheKey = `${prov}:${sym}:${tf}`;
+      const existingBundle = candlesCacheRef.current[cacheKey];
 
-      if (forceFreshLtf) {
-        delete candlesCacheRef.current[`${prov}:${sym}:${tf}`];
-      }
-
-      const cachedLtf = candlesCacheRef.current[`${prov}:${sym}:${tf}`];
-      if (cachedLtf && !forceFreshLtf) {
+      // Render cached bundle immediately so chart/signals never flicker or blank out
+      if (existingBundle && existingBundle.closedBars.length >= 30) {
         const cHtf = candlesCacheRef.current[`${prov}:${sym}:${prof.htf}`];
         const cD1 = candlesCacheRef.current[`${prov}:${sym}:D1`];
         const cH1 = candlesCacheRef.current[`${prov}:${sym}:H1`];
         applyEvaluationToUI(
           sym,
           tf,
-          cachedLtf,
+          existingBundle,
           cHtf?.closedBars || null,
           cD1?.closedBars || null,
           cH1?.closedBars || null,
@@ -570,10 +692,40 @@ export default function App() {
         const d1Bars = tf === 'D1' ? ltf.closedBars : d1R.status === 'fulfilled' ? d1R.value?.closedBars || null : null;
         const h1Bars = tf === 'H1' ? ltf.closedBars : h1R.status === 'fulfilled' ? h1R.value?.closedBars || null : null;
 
-        applyEvaluationToUI(sym, tf, ltf, htfBars, d1Bars, h1Bars, isBarCloseOrLoad, performance.now() - t0, true);
+        const evaluated = applyEvaluationToUI(
+          sym,
+          tf,
+          ltf,
+          htfBars,
+          d1Bars,
+          h1Bars,
+          isBarCloseOrLoad,
+          performance.now() - t0,
+          true
+        );
+        scheduleAutoAi(evaluated);
         return ltf.closedBars.length ? ltf.closedBars[ltf.closedBars.length - 1].timeMs : 0;
       } catch (err: any) {
         if (myEp !== analysisEpochRef.current) return 0;
+        const fallbackBundle = candlesCacheRef.current[cacheKey];
+        if (fallbackBundle && fallbackBundle.closedBars.length >= 30) {
+          // Keep live chart & quant analysis alive on cached candles when mobile Safari/network aborts a refresh
+          const cHtf = candlesCacheRef.current[`${prov}:${sym}:${prof.htf}`];
+          const cD1 = candlesCacheRef.current[`${prov}:${sym}:D1`];
+          const cH1 = candlesCacheRef.current[`${prov}:${sym}:H1`];
+          applyEvaluationToUI(
+            sym,
+            tf,
+            fallbackBundle,
+            cHtf?.closedBars || null,
+            cD1?.closedBars || null,
+            cH1?.closedBars || null,
+            false,
+            performance.now() - t0,
+            false
+          );
+          return fallbackBundle.closedBars[fallbackBundle.closedBars.length - 1].timeMs;
+        }
         const msg = err?.message || 'Feed unavailable';
         setAnalysisLatencyMs(Math.max(0.1, performance.now() - t0));
         setChartErrorMsg(msg);
@@ -588,7 +740,7 @@ export default function App() {
         return 0;
       }
     },
-    [applyEvaluationToUI]
+    [applyEvaluationToUI, scheduleAutoAi]
   );
 
   const scheduleTickEvaluation = useCallback(() => {
@@ -849,12 +1001,38 @@ export default function App() {
     return () => clearInterval(id);
   }, [currentTF, showToast, triggerCandleCloseRefresh]);
 
+  // Auto-recover SignalR & live candles when returning from mobile Safari sleep/background
+  useEffect(() => {
+    const handleWake = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (stateRef.current.provider === 'BIQUOTE') {
+        fetchBiquoteLatestSnapshot(quotesRef.current)
+          .then(() => setQuoteRenderSeq((n) => (n + 1) % 1000000))
+          .catch(() => {});
+        if (signalRStateRef.current !== 'CONNECTED') {
+          connectBiquoteSignalR();
+        }
+        analyzeActiveMarket(true, true);
+      } else {
+        checkExnessBridge(true);
+      }
+    };
+    document.addEventListener('visibilitychange', handleWake);
+    window.addEventListener('pageshow', handleWake);
+    return () => {
+      document.removeEventListener('visibilitychange', handleWake);
+      window.removeEventListener('pageshow', handleWake);
+    };
+  }, [analyzeActiveMarket, checkExnessBridge, connectBiquoteSignalR]);
+
   useEffect(() => {
     return () => {
       candleRetryTimersRef.current.forEach(clearTimeout);
       if (queuedTickTimerRef.current) clearTimeout(queuedTickTimerRef.current);
       if (pendingWfTimerRef.current) clearTimeout(pendingWfTimerRef.current);
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      if (aiDebounceTimerRef.current) clearTimeout(aiDebounceTimerRef.current);
+      if (aiAbortRef.current) aiAbortRef.current.abort();
       if (signalRConnRef.current) signalRConnRef.current.stop().catch(() => {});
     };
   }, []);
@@ -869,6 +1047,10 @@ export default function App() {
   const handleSetLang = (l: LangCode) => {
     localStorage.setItem(STORAGE_KEYS.language, l);
     setLang(l);
+    stateRef.current.lang = l;
+    if (stateRef.current.autoAi) {
+      setTimeout(() => runAiAnalysis(true), 50);
+    }
   };
 
   const handleToggleAlert = () => {
@@ -1705,10 +1887,14 @@ export default function App() {
                         <span>LOCKED</span>
                       </span>
                     )}
-                    {currentSignal.reversalWarning && (
+                    {(currentSignal.reversalWarning || currentSignal.reversalInfo?.active) && (
                       <span className="inline-flex items-center gap-1 rounded-md border border-red-500/45 bg-red-500/15 px-2 py-0.5 font-mono text-[10px] font-bold text-red-400">
                         <AlertTriangle className="h-3 w-3" />
-                        <span>REVERSAL PRESSURE</span>
+                        <span>
+                          {currentSignal.reversalInfo?.active
+                            ? `REVERSAL AT ${currentSignal.reversalInfo.zoneName}`
+                            : 'REVERSAL PRESSURE'}
+                        </span>
                       </span>
                     )}
                   </div>
@@ -1827,6 +2013,15 @@ export default function App() {
                 </div>
               )}
 
+              {currentSignal.reversalInfo?.active && !currentSignal.watchNote?.includes(currentSignal.reversalInfo.zoneName) && (
+                <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl border border-amber-500/45 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                  <span className="font-mono">
+                    {currentSignal.reversalInfo.reason} → {currentSignal.reversalInfo.side} Rejection/Bounce
+                  </span>
+                  <span className="font-mono text-[10px] font-bold text-amber-400">S/R</span>
+                </div>
+              )}
+
               {/* Metrics Strip */}
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#1e2535] bg-[#080a0f] px-3 py-2 font-mono text-[11px] text-slate-300">
                 <span>
@@ -1930,6 +2125,26 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {/* Real Gemini AI Market Analyst */}
+            <AiAnalystCard
+              lang={lang}
+              symbol={activeSymbol}
+              tf={currentTF}
+              result={aiAnalysis}
+              loading={aiLoading}
+              error={aiError}
+              autoAi={autoAi}
+              onToggleAutoAi={() =>
+                setAutoAi((prev) => {
+                  const next = !prev;
+                  stateRef.current.autoAi = next;
+                  if (next) runAiAnalysis(true);
+                  return next;
+                })
+              }
+              onAnalyzeNow={() => runAiAnalysis(true)}
+            />
 
             {/* Interactive SVG Chart */}
             <TradingChart
