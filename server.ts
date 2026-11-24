@@ -4,7 +4,7 @@ import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { analyzeMarketWithGemini } from './src/server/aiAnalyzeCore.ts';
+import { analyzeMarketWithGemini, resolveGeminiApiKey } from './src/server/aiAnalyzeCore.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,7 +18,7 @@ async function startServer() {
   app.use(express.json({ limit: '256kb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, aiConfigured: Boolean(process.env.GEMINI_API_KEY) });
+    res.json({ ok: true, aiConfigured: Boolean(resolveGeminiApiKey()) });
   });
 
   app.post('/api/ai-analyze', async (req, res) => {

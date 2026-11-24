@@ -146,15 +146,27 @@ function formatGeminiError(err: unknown): { status: number; message: string; ret
   };
 }
 
+export function resolveGeminiApiKey(): string | null {
+  const raw =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.API_KEY ||
+    '';
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '');
+  return cleaned.length > 10 ? cleaned : null;
+}
+
 export async function analyzeMarketWithGemini(
   rawBody: unknown
 ): Promise<{ ok: true; status: number; data: AiAnalyzeResponsePayload } | { ok: false; status: number; error: string }> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = resolveGeminiApiKey();
   if (!apiKey) {
     return {
       ok: false,
       status: 503,
-      error: 'GEMINI_API_KEY is not configured in environment variables.',
+      error:
+        'GEMINI_API_KEY not found on server. On Vercel: Settings → Environment Variables → add GEMINI_API_KEY (Production & Preview) → Redeploy.',
     };
   }
 
@@ -218,7 +230,7 @@ export async function analyzeMarketWithGemini(
   };
 
   const modelsToTry = Array.from(
-    new Set([process.env.GEMINI_MODEL || 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'])
+    new Set([process.env.GEMINI_MODEL || 'gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'])
   );
 
   let lastErr: { status: number; message: string } = { status: 502, message: 'Gemini AI analysis failed' };
