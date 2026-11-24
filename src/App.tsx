@@ -236,6 +236,7 @@ export default function App() {
   const aiAbortRef = useRef<AbortController | null>(null);
   const aiDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAiDispatchRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
+  const aiCacheRef = useRef<Record<string, { result: AiAnalysisResult; candleTime: number; fetchedAt: number }>>({});
 
   const signalRConnRef = useRef<signalR.HubConnection | null>(null);
   const signalRStateRef = useRef<string>('DISCONNECTED');
@@ -546,12 +547,22 @@ export default function App() {
 
     if (!quote || !bundle || bundle.closedBars.length < 10) return;
 
-    const dispatchKey = `${sym}:${tf}:${lng}:${sig.candleTime}:${sig.state}:${sig.reversalInfo?.active ? sig.reversalInfo.zoneName : 'none'}`;
+    const cacheKey = `${sym}:${tf}:${lng}`;
+    const cached = aiCacheRef.current[cacheKey];
     const now = Date.now();
-    if (!force && lastAiDispatchRef.current.key === dispatchKey && now - lastAiDispatchRef.current.at < 20000) {
-      return;
+
+    if (!force) {
+      if (cached && cached.candleTime === sig.candleTime && now - cached.fetchedAt < 180000) {
+        setAiAnalysis(cached.result);
+        setAiError(null);
+        return;
+      }
+      if (now - lastAiDispatchRef.current.at < 45000) {
+        return;
+      }
     }
 
+    const dispatchKey = `${cacheKey}:${sig.candleTime}`;
     lastAiDispatchRef.current = { key: dispatchKey, at: now };
     if (aiAbortRef.current) {
       aiAbortRef.current.abort();
@@ -613,10 +624,23 @@ export default function App() {
           })),
         }),
       });
-      const data = await res.json();
+      const rawBody = await res.text();
+      let data: any = null;
+      try {
+        data = rawBody ? JSON.parse(rawBody) : null;
+      } catch {
+        const preview = rawBody.trim().slice(0, 80);
+        throw new Error(
+          preview.startsWith('<')
+            ? `AI backend unreachable (HTTP ${res.status}). Ensure /api/ai-analyze & GEMINI_API_KEY are configured.`
+            : `AI response format error (HTTP ${res.status})`
+        );
+      }
       if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
-      if (!ctrl.signal.aborted) {
-        setAiAnalysis(data as AiAnalysisResult);
+      if (!ctrl.signal.aborted && data) {
+        const result = data as AiAnalysisResult;
+        aiCacheRef.current[cacheKey] = { result, candleTime: sig.candleTime, fetchedAt: Date.now() };
+        setAiAnalysis(result);
       }
     } catch (err: any) {
       if (err?.name === 'AbortError' || ctrl.signal.aborted) return;
@@ -1091,6 +1115,9 @@ export default function App() {
     setActiveSymbol(sym);
     setActiveDesk(desk);
     stateRef.current.activeSymbol = sym;
+    const cachedAi = aiCacheRef.current[`${sym}:${currentTF}:${lang}`];
+    setAiAnalysis(cachedAi?.result || null);
+    setAiError(null);
     analyzeActiveMarket(true, false, sym, currentTF, provider);
   };
 
@@ -1102,6 +1129,9 @@ export default function App() {
       localStorage.setItem(STORAGE_KEYS.symbol, nextSym);
       setActiveSymbol(nextSym);
       stateRef.current.activeSymbol = nextSym;
+      const cachedAi = aiCacheRef.current[`${nextSym}:${currentTF}:${lang}`];
+      setAiAnalysis(cachedAi?.result || null);
+      setAiError(null);
       analyzeActiveMarket(true, false, nextSym, currentTF, provider);
     }
   };
@@ -1109,6 +1139,9 @@ export default function App() {
   const handleChangeTimeframe = (tf: TimeframeKey) => {
     setCurrentTF(tf);
     stateRef.current.currentTF = tf;
+    const cachedAi = aiCacheRef.current[`${activeSymbol}:${tf}:${lang}`];
+    setAiAnalysis(cachedAi?.result || null);
+    setAiError(null);
     analyzeActiveMarket(true, false, activeSymbol, tf, provider);
   };
 

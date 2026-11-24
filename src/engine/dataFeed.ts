@@ -37,7 +37,12 @@ export async function biquoteFetchJson(url: string, retries = 1): Promise<any> {
         throw new Error(`HTTP 429 retry in ${ra}s`);
       }
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return await r.json();
+      const rawText = await r.text();
+      try {
+        return JSON.parse(rawText);
+      } catch {
+        throw new Error(`Invalid JSON (HTTP ${r.status})`);
+      }
     } catch (err: any) {
       lastErr = err;
       const msg = String(err?.message || err || '');
