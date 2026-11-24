@@ -147,12 +147,24 @@ function formatGeminiError(err: unknown): { status: number; message: string; ret
 }
 
 export function resolveGeminiApiKey(): string | null {
-  const raw =
+  let raw =
     process.env.GEMINI_API_KEY ||
     process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
     process.env.GOOGLE_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY ||
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
     process.env.API_KEY ||
     '';
+
+  if (!raw) {
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v && /^(VITE_|NEXT_PUBLIC_)?(GEMINI|GOOGLE_GENERATIVE_AI|GOOGLE_API).*KEY$/i.test(k.trim())) {
+        raw = v;
+        break;
+      }
+    }
+  }
+
   const cleaned = raw.trim().replace(/^["']|["']$/g, '');
   return cleaned.length > 10 ? cleaned : null;
 }

@@ -5,6 +5,8 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { analyzeMarketWithGemini, resolveGeminiApiKey } from './src/server/aiAnalyzeCore.ts';
+import { proxyBiquoteGet } from './src/server/biquoteProxyCore.ts';
+import { fetchFallbackCandles, fetchFallbackQuotes } from './src/server/marketFallbackCore.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,6 +30,42 @@ async function startServer() {
     } else {
       res.status(result.status).json({ error: result.error });
     }
+  });
+
+  app.get('/api/biquote', async (req, res) => {
+    const p = Array.isArray(req.query?.path) ? req.query.path[0] : req.query?.path;
+    const result = await proxyBiquoteGet(p);
+    if (result.ok) {
+      res.status(result.status).json(result.data);
+    } else {
+      res.status(result.status).json({ error: result.error });
+    }
+  });
+
+  app.get('/api/market-fallback', async (req, res) => {
+    const mode = Array.isArray(req.query?.mode) ? req.query.mode[0] : req.query?.mode;
+    if (mode === 'quotes') {
+      const quotes = await fetchFallbackQuotes();
+      const count = Object.keys(quotes).length;
+      if (!count) {
+        res.status(502).json({ error: 'Backup quote providers unavailable' });
+        return;
+      }
+      res.json({ ok: true, count, quotes });
+      return;
+    }
+    if (mode === 'candles') {
+      const symbol = String(Array.isArray(req.query?.symbol) ? req.query.symbol[0] : req.query?.symbol || '');
+      const tf = String(Array.isArray(req.query?.tf) ? req.query.tf[0] : req.query?.tf || '');
+      const result = await fetchFallbackCandles(symbol, tf);
+      if (result.ok) {
+        res.json(result);
+      } else {
+        res.status(result.status).json({ error: result.error });
+      }
+      return;
+    }
+    res.status(400).json({ error: 'Invalid mode. Use mode=quotes or mode=candles.' });
   });
 
   if (!isProd) {

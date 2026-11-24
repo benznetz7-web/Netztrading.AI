@@ -34,8 +34,10 @@ import {
   evaluateQuoteFreshness,
   fetchBiquoteLatestSnapshot,
   fetchSymbolCandles,
+  getActiveFeedMode,
   ingestQuoteUpdate,
   playSignalSound,
+  resetBiquoteBackoff,
   safeFetch,
   type QuotesByProvider,
 } from './engine/dataFeed';
@@ -856,8 +858,9 @@ export default function App() {
         signalRStateRef.current = 'DISCONNECTED';
         subscribedKeyRef.current = '';
         if (stateRef.current.provider === 'BIQUOTE') {
-          setStatusMessage('SignalR off — polling');
-          setStatusLevel('warn');
+          const isBackup = getActiveFeedMode() === 'BACKUP';
+          setStatusMessage(isBackup ? 'Backup Feed · Live' : 'SignalR off — polling');
+          setStatusLevel(isBackup ? 'ok' : 'warn');
         }
       });
 
@@ -869,7 +872,7 @@ export default function App() {
       setStatusLevel('ok');
     } catch {
       signalRStateRef.current = 'POLLING';
-      setStatusMessage('BIQUOTE · Polling');
+      setStatusMessage(getActiveFeedMode() === 'BACKUP' ? 'Backup Feed · Live' : 'BIQUOTE · Polling');
       setStatusLevel('ok');
     } finally {
       isConnectingSrRef.current = false;
@@ -963,8 +966,12 @@ export default function App() {
       setStatusLevel('warn');
       checkBiquoteActiveSymbols().catch(() => {});
       fetchBiquoteLatestSnapshot(quotesRef.current)
-        .then(() => {
+        .then((mode) => {
           setQuoteRenderSeq((n) => (n + 1) % 1000000);
+          if (signalRStateRef.current !== 'CONNECTED') {
+            setStatusMessage(mode === 'BACKUP' ? 'Backup Feed · Live' : 'BIQUOTE · Polling');
+            setStatusLevel('ok');
+          }
           analyzeActiveMarket(true, false, stateRef.current.activeSymbol, stateRef.current.currentTF, 'BIQUOTE');
         })
         .catch((e: any) => {
@@ -977,10 +984,26 @@ export default function App() {
       fallbackPollId = setInterval(() => {
         if (stateRef.current.provider === 'BIQUOTE' && signalRStateRef.current !== 'CONNECTED') {
           fetchBiquoteLatestSnapshot(quotesRef.current)
-            .then(() => {
+            .then((mode) => {
               setQuoteRenderSeq((n) => (n + 1) % 1000000);
-              const q = quotesRef.current.BIQUOTE?.[stateRef.current.activeSymbol];
-              if (q) evaluateActiveLockOnTick(q);
+              if (signalRStateRef.current !== 'CONNECTED') {
+                setStatusMessage(mode === 'BACKUP' ? 'Backup Feed · Live' : 'BIQUOTE · Polling');
+                setStatusLevel('ok');
+              }
+              const sym = stateRef.current.activeSymbol;
+              const q = quotesRef.current.BIQUOTE?.[sym];
+              if (q) {
+                evaluateActiveLockOnTick(q);
+                const c = candlesCacheRef.current[`BIQUOTE:${sym}:${stateRef.current.currentTF}`];
+                if (c?.formingBar) {
+                  c.formingBar.close = q.mid;
+                  c.formingBar.high = Math.max(c.formingBar.high, q.mid);
+                  c.formingBar.low = Math.min(c.formingBar.low, q.mid);
+                }
+                if (!activeLocksRef.current[getLockKey()]) {
+                  scheduleTickEvaluation();
+                }
+              }
             })
             .catch(() => {});
         }
@@ -1088,12 +1111,19 @@ export default function App() {
     setRefreshing(true);
     try {
       if (provider === 'BIQUOTE') {
+        resetBiquoteBackoff();
         await checkBiquoteActiveSymbols().catch(() => {});
-        await fetchBiquoteLatestSnapshot(quotesRef.current);
+        const mode = await fetchBiquoteLatestSnapshot(quotesRef.current);
         setQuoteRenderSeq((n) => (n + 1) % 1000000);
-        if (signalRStateRef.current !== 'CONNECTED') await connectBiquoteSignalR();
+        if (signalRStateRef.current !== 'CONNECTED' && mode === 'BIQUOTE') {
+          await connectBiquoteSignalR();
+        }
+        if (signalRStateRef.current !== 'CONNECTED') {
+          setStatusMessage(mode === 'BACKUP' ? 'Backup Feed · Live' : 'BIQUOTE · Polling');
+          setStatusLevel('ok');
+        }
         await analyzeActiveMarket(true, true);
-        showToast('Refreshed');
+        showToast(mode === 'BACKUP' ? 'Refreshed (Backup Feed)' : 'Refreshed');
       } else {
         await checkExnessBridge(true);
         showToast('Exness checked');

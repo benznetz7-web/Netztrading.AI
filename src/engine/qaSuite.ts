@@ -1,6 +1,14 @@
 import { APP_VERSION, BIQUOTE_BASE } from '../constants/markets';
 import type { ActiveLock, CandleBar, RiskConfig } from '../types/trading';
-import { biquoteFetchJson, checkBiquoteActiveSymbols, evaluateQuoteFreshness, ingestQuoteUpdate, type QuotesByProvider } from './dataFeed';
+import {
+  biquoteFetchJson,
+  checkBiquoteActiveSymbols,
+  evaluateQuoteFreshness,
+  ingestQuoteUpdate,
+  resetBiquoteBackoff,
+  safeFetch,
+  type QuotesByProvider,
+} from './dataFeed';
 import { aggregateWeeklyFromDaily } from './indicators';
 import {
   analyzeFVGs,
@@ -348,7 +356,8 @@ export async function executeFullQaSuite(
   }
 
   onLog({ text: `Unit Summary: ${pass}/${tests.length} PASSED, ${fail} FAILED`, status: 'info' });
-  onLog({ text: 'Running Live BIQUOTE API (Forex + Crypto) & SignalR Checks…', status: 'info' });
+  onLog({ text: 'Running Live BIQUOTE API (Forex + Crypto) & Backup Feed Checks…', status: 'info' });
+  resetBiquoteBackoff();
 
   const liveChecks: Array<[string, () => Promise<string>]> = [
     ['GET /api/active', async () => `Active=${(await checkBiquoteActiveSymbols()).size}`],
@@ -373,6 +382,19 @@ export async function executeFullQaSuite(
     ],
     ['SignalR /hubs/tick', async () => `State=${signalRState}`],
   ];
+
+  if (typeof window !== 'undefined') {
+    liveChecks.push([
+      'Backup Feed (Swissquote + Kraken + Yahoo)',
+      async () => {
+        const r = await safeFetch('/api/market-fallback?mode=quotes', {}, 10000);
+        const raw = await r.text();
+        const d = raw ? JSON.parse(raw) : null;
+        if (!r.ok || !d?.quotes) throw new Error(d?.error || `HTTP ${r.status}`);
+        return `${d.count}/14 pairs (XAU=${d.quotes?.XAUUSD?.mid?.toFixed?.(2) ?? '—'}, BTC=${d.quotes?.BTCUSD?.mid?.toFixed?.(1) ?? '—'})`;
+      },
+    ]);
+  }
 
   for (const [n, fn] of liveChecks) {
     try {

@@ -18,6 +18,16 @@ import { aggregateWeeklyFromDaily } from './indicators';
 export type QuotesByProvider = Record<ProviderType, Record<string, QuoteData>>;
 
 let rateLimitUntilMs = 0;
+let biquoteDownUntilMs = 0;
+let activeFeedMode: 'BIQUOTE' | 'BACKUP' = 'BIQUOTE';
+
+export function getActiveFeedMode(): 'BIQUOTE' | 'BACKUP' {
+  return activeFeedMode;
+}
+
+export function resetBiquoteBackoff(): void {
+  biquoteDownUntilMs = 0;
+}
 
 export function safeFetch(url: string, opt: RequestInit = {}, ms = 15000): Promise<Response> {
   const c = new AbortController();
@@ -50,6 +60,29 @@ export async function biquoteFetchJson(url: string, retries = 1): Promise<any> {
       await new Promise((res) => setTimeout(res, 450));
     }
   }
+
+  // Fallback to same-origin /api/biquote proxy in browser so CORS-stripped 502/503 pages don't show cryptic "Load failed"
+  if (typeof window !== 'undefined' && url.startsWith(BIQUOTE_BASE)) {
+    const relPath = url.slice(BIQUOTE_BASE.length);
+    try {
+      const pr = await safeFetch(`/api/biquote?path=${encodeURIComponent(relPath)}`, {}, 12000);
+      const raw = await pr.text();
+      let parsed: any = null;
+      try {
+        parsed = raw ? JSON.parse(raw) : null;
+      } catch {
+        // ignore
+      }
+      if (pr.ok && parsed) return parsed;
+      if (parsed?.error) throw new Error(String(parsed.error));
+      if (!pr.ok) throw new Error(`BIQUOTE HTTP ${pr.status}`);
+    } catch (proxyErr: any) {
+      if (proxyErr?.message && !String(proxyErr.message).includes('Load failed')) {
+        throw proxyErr;
+      }
+    }
+  }
+
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr || 'Network error'));
 }
 
@@ -161,7 +194,43 @@ export async function checkBiquoteActiveSymbols(): Promise<Set<string>> {
   return f;
 }
 
-export async function fetchBiquoteLatestSnapshot(quotesByProvider: QuotesByProvider): Promise<void> {
+export async function fetchBackupQuotesSnapshot(
+  quotesByProvider: QuotesByProvider
+): Promise<{ count: number; sources: string[] }> {
+  const r = await safeFetch('/api/market-fallback?mode=quotes', {}, 12000);
+  const raw = await r.text();
+  let parsed: any = null;
+  try {
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch {
+    throw new Error(`Backup feed format error (HTTP ${r.status})`);
+  }
+  if (!r.ok || !parsed?.quotes) {
+    throw new Error(parsed?.error || `Backup feed HTTP ${r.status}`);
+  }
+  let count = 0;
+  const sources = new Set<string>();
+  for (const [sym, q] of Object.entries<any>(parsed.quotes)) {
+    if (!SUPPORTED_SYMBOLS.includes(sym)) continue;
+    const res = ingestQuoteUpdate(quotesByProvider, sym, q, 'BIQUOTE', true);
+    if (res.accepted || res.reason === 'Duplicate (age preserved)') {
+      count++;
+      if (q?.source) sources.add(String(q.source));
+    }
+  }
+  if (!count) throw new Error('Backup feed returned no valid quotes');
+  return { count, sources: Array.from(sources) };
+}
+
+export async function fetchBiquoteLatestSnapshot(
+  quotesByProvider: QuotesByProvider
+): Promise<'BIQUOTE' | 'BACKUP'> {
+  if (typeof window !== 'undefined' && Date.now() < biquoteDownUntilMs) {
+    await fetchBackupQuotesSnapshot(quotesByProvider);
+    activeFeedMode = 'BACKUP';
+    return 'BACKUP';
+  }
+
   const forexSyms = SUPPORTED_SYMBOLS.filter((s) => SYMBOL_SPECS[s].desk === 'FOREX');
   const cryptoSyms = SUPPORTED_SYMBOLS.filter((s) => SYMBOL_SPECS[s].desk === 'CRYPTO');
 
@@ -179,8 +248,80 @@ export async function fetchBiquoteLatestSnapshot(quotesByProvider: QuotesByProvi
 
   const results = await Promise.allSettled([fetchBatch(forexSyms), fetchBatch(cryptoSyms)]);
   if (results.every((r) => r.status === 'rejected')) {
+    biquoteDownUntilMs = Date.now() + 30000;
+    if (typeof window !== 'undefined') {
+      try {
+        await fetchBackupQuotesSnapshot(quotesByProvider);
+        activeFeedMode = 'BACKUP';
+        return 'BACKUP';
+      } catch {
+        // surface primary error below if backup also fails
+      }
+    }
     throw (results[0] as PromiseRejectedResult).reason;
   }
+  biquoteDownUntilMs = 0;
+  activeFeedMode = 'BIQUOTE';
+  return 'BIQUOTE';
+}
+
+async function fetchBackupSymbolCandles(
+  sym: string,
+  tf: TimeframeKey,
+  candlesCache: Record<string, CandleBundle>,
+  cacheKey: string
+): Promise<CandleBundle> {
+  const r = await safeFetch(
+    `/api/market-fallback?mode=candles&symbol=${encodeURIComponent(sym)}&tf=${encodeURIComponent(tf)}`,
+    {},
+    12000
+  );
+  const raw = await r.text();
+  let parsed: any = null;
+  try {
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch {
+    throw new Error(`Backup OHLC format error (HTTP ${r.status})`);
+  }
+  if (!r.ok || !parsed?.ok || !Array.isArray(parsed.closedBars)) {
+    throw new Error(parsed?.error || `Backup OHLC HTTP ${r.status}`);
+  }
+  const closedBars: CandleBar[] = parsed.closedBars
+    .map((b: any) => ({
+      openTime: b.openTime,
+      timeMs: Number(b.timeMs),
+      open: Number(b.open),
+      high: Number(b.high),
+      low: Number(b.low),
+      close: Number(b.close),
+      isOpen: false,
+    }))
+    .filter((b: CandleBar) => Number.isFinite(b.timeMs) && [b.open, b.high, b.low, b.close].every(Number.isFinite))
+    .sort((a: CandleBar, b: CandleBar) => a.timeMs - b.timeMs);
+
+  const fb = parsed.formingBar
+    ? {
+        openTime: parsed.formingBar.openTime,
+        timeMs: Number(parsed.formingBar.timeMs),
+        open: Number(parsed.formingBar.open),
+        high: Number(parsed.formingBar.high),
+        low: Number(parsed.formingBar.low),
+        close: Number(parsed.formingBar.close),
+        isOpen: true,
+      }
+    : null;
+
+  if (closedBars.length < 20) {
+    throw new Error(`Insufficient backup bars for ${sym} (${tf})`);
+  }
+  const res: CandleBundle = {
+    closedBars,
+    formingBar: fb && Number.isFinite(fb.close) ? fb : null,
+    fetchedAt: Date.now(),
+  };
+  candlesCache[cacheKey] = res;
+  activeFeedMode = 'BACKUP';
+  return res;
 }
 
 export async function fetchSymbolCandles(
@@ -229,34 +370,52 @@ export async function fetchSymbolCandles(
     return res;
   }
 
-  const iv = TF_PROFILES[tf]?.biquote;
-  const p = await biquoteFetchJson(
-    `${BIQUOTE_BASE}/api/${encodeURIComponent(sym)}/ohlc?interval=${encodeURIComponent(iv)}&limit=300`
-  );
-  const rb = Array.isArray(p?.bars) ? p.bars : [];
-  if (!rb.length) throw new Error(`No OHLC bars for ${sym} (${iv})`);
+  if (typeof window !== 'undefined' && Date.now() < biquoteDownUntilMs) {
+    return fetchBackupSymbolCandles(sym, tf, candlesCache, key);
+  }
 
-  const parsed: CandleBar[] = rb
-    .map((b: any) => ({
-      openTime: b.openTime,
-      timeMs: Date.parse(b.openTime),
-      open: Number(b.open),
-      high: Number(b.high),
-      low: Number(b.low),
-      close: Number(b.close),
-      isOpen: Boolean(b.isOpen),
-    }))
-    .filter((b: CandleBar) => Number.isFinite(b.timeMs) && [b.open, b.high, b.low, b.close].every(Number.isFinite))
-    .sort((a: CandleBar, b: CandleBar) => a.timeMs - b.timeMs);
+  try {
+    const iv = TF_PROFILES[tf]?.biquote;
+    const p = await biquoteFetchJson(
+      `${BIQUOTE_BASE}/api/${encodeURIComponent(sym)}/ohlc?interval=${encodeURIComponent(iv)}&limit=300`
+    );
+    const rb = Array.isArray(p?.bars) ? p.bars : [];
+    if (!rb.length) throw new Error(`No OHLC bars for ${sym} (${iv})`);
 
-  const f = parsed.filter((b) => b.isOpen);
-  const res: CandleBundle = {
-    closedBars: parsed.filter((b) => !b.isOpen),
-    formingBar: f.length ? f[f.length - 1] : null,
-    fetchedAt: Date.now(),
-  };
-  candlesCache[key] = res;
-  return res;
+    const parsed: CandleBar[] = rb
+      .map((b: any) => ({
+        openTime: b.openTime,
+        timeMs: Date.parse(b.openTime),
+        open: Number(b.open),
+        high: Number(b.high),
+        low: Number(b.low),
+        close: Number(b.close),
+        isOpen: Boolean(b.isOpen),
+      }))
+      .filter((b: CandleBar) => Number.isFinite(b.timeMs) && [b.open, b.high, b.low, b.close].every(Number.isFinite))
+      .sort((a: CandleBar, b: CandleBar) => a.timeMs - b.timeMs);
+
+    const f = parsed.filter((b) => b.isOpen);
+    const res: CandleBundle = {
+      closedBars: parsed.filter((b) => !b.isOpen),
+      formingBar: f.length ? f[f.length - 1] : null,
+      fetchedAt: Date.now(),
+    };
+    candlesCache[key] = res;
+    biquoteDownUntilMs = 0;
+    activeFeedMode = 'BIQUOTE';
+    return res;
+  } catch (err) {
+    biquoteDownUntilMs = Date.now() + 30000;
+    if (typeof window !== 'undefined') {
+      try {
+        return await fetchBackupSymbolCandles(sym, tf, candlesCache, key);
+      } catch {
+        // throw original error if backup also fails
+      }
+    }
+    throw err;
+  }
 }
 
 export function playSignalSound(): void {
