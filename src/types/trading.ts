@@ -214,6 +214,7 @@ export interface AiAnalysisResult {
   riskNote: string;
   summary: string;
   analyzedAt: string;
+  modelUsed?: string;
 }
 
 export interface SignalOutput {

@@ -213,7 +213,14 @@ export default function App() {
   const [aiAnalysis, setAiAnalysis] = useState<AiAnalysisResult | null>(null);
   const [aiLoading, setAiLoading] = useState<boolean>(false);
   const [aiError, setAiError] = useState<string | null>(null);
-  const [autoAi, setAutoAi] = useState<boolean>(true);
+  const [autoAi, setAutoAi] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('nethaga_auto_ai_v1');
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
 
   // Mutable high-frequency refs (zero stale closures, zero wasted DOM churn)
   const quotesRef = useRef<QuotesByProvider>({ BIQUOTE: {}, EXNESS: {} });
@@ -238,8 +245,11 @@ export default function App() {
   const aiAbortRef = useRef<AbortController | null>(null);
   const aiInFlightKeyRef = useRef<string | null>(null);
   const aiQuotaBackoffUntilRef = useRef<number>(0);
+  const aiAutoRetriedKeyRef = useRef<string>('');
+  const aiAutoRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aiDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAiDispatchRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
+  const lastAutoAiGlobalAtRef = useRef<number>(0);
   const aiCacheRef = useRef<Record<string, { result: AiAnalysisResult; candleTime: number; fetchedAt: number }>>({});
 
   const signalRConnRef = useRef<signalR.HubConnection | null>(null);
@@ -574,9 +584,15 @@ export default function App() {
       if (lastAiDispatchRef.current.key === dispatchKey && now - lastAiDispatchRef.current.at < 45000) {
         return;
       }
+      if (now - lastAutoAiGlobalAtRef.current < 35000) {
+        return;
+      }
     }
 
     lastAiDispatchRef.current = { key: dispatchKey, at: now };
+    if (!force) {
+      lastAutoAiGlobalAtRef.current = now;
+    }
     if (aiAbortRef.current) {
       aiAbortRef.current.abort();
     }
@@ -587,90 +603,137 @@ export default function App() {
     const timeoutId = setTimeout(() => {
       timedOut = true;
       ctrl.abort();
-    }, 26000);
+    }, 30000);
 
     setAiLoading(true);
     setAiError(null);
 
-    try {
-      const res = await fetch('/api/ai-analyze', {
+    const requestBody = JSON.stringify({
+      symbol: sym,
+      tf,
+      lang: lng,
+      quote: {
+        bid: quote.bid,
+        ask: quote.ask,
+        mid: quote.mid,
+        spread: quote.spread,
+      },
+      quantSignal: {
+        state: sig.state,
+        type: sig.type,
+        entryMode: sig.entryMode,
+        setupScore: sig.setupScore,
+        entry: sig.entry,
+        sl: sig.sl,
+        tp1: sig.tp1,
+        tp2: sig.tp2,
+        tp3: sig.tp3,
+        regime: sig.regime.regime,
+        ema8: sig.ema8,
+        ema21: sig.ema21,
+        macdHist: sig.macdHist,
+        rsi14: sig.rsi14,
+        atr14: sig.atr14,
+        structure: sig.structure.label,
+        reversalWarning: sig.reversalWarning,
+        reversalReason: sig.reversalInfo?.active ? sig.reversalInfo.reason : null,
+      },
+      keyLevels: {
+        r1: sig.keyLevels.r1?.price ?? null,
+        r2: sig.keyLevels.r2?.price ?? null,
+        s1: sig.keyLevels.s1?.price ?? null,
+        s2: sig.keyLevels.s2?.price ?? null,
+        pdh: sig.keyLevels.pdh ?? null,
+        pdl: sig.keyLevels.pdl ?? null,
+      },
+      recentCandles: bundle.closedBars.slice(-14).map((b) => ({
+        t: b.openTime || new Date(b.timeMs).toISOString(),
+        o: b.open,
+        h: b.high,
+        l: b.low,
+        c: b.close,
+      })),
+    });
+
+    const postAnalyze = () =>
+      fetch('/api/ai-analyze', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
         signal: ctrl.signal,
-        body: JSON.stringify({
-          symbol: sym,
-          tf,
-          lang: lng,
-          quote: {
-            bid: quote.bid,
-            ask: quote.ask,
-            mid: quote.mid,
-            spread: quote.spread,
-          },
-          quantSignal: {
-            state: sig.state,
-            type: sig.type,
-            entryMode: sig.entryMode,
-            setupScore: sig.setupScore,
-            entry: sig.entry,
-            sl: sig.sl,
-            tp1: sig.tp1,
-            tp2: sig.tp2,
-            tp3: sig.tp3,
-            regime: sig.regime.regime,
-            ema8: sig.ema8,
-            ema21: sig.ema21,
-            macdHist: sig.macdHist,
-            rsi14: sig.rsi14,
-            atr14: sig.atr14,
-            structure: sig.structure.label,
-            reversalWarning: sig.reversalWarning,
-            reversalReason: sig.reversalInfo?.active ? sig.reversalInfo.reason : null,
-          },
-          keyLevels: {
-            r1: sig.keyLevels.r1?.price ?? null,
-            r2: sig.keyLevels.r2?.price ?? null,
-            s1: sig.keyLevels.s1?.price ?? null,
-            s2: sig.keyLevels.s2?.price ?? null,
-            pdh: sig.keyLevels.pdh ?? null,
-            pdl: sig.keyLevels.pdl ?? null,
-          },
-          recentCandles: bundle.closedBars.slice(-24).map((b) => ({
-            t: b.openTime || new Date(b.timeMs).toISOString(),
-            o: b.open,
-            h: b.high,
-            l: b.low,
-            c: b.close,
-          })),
-        }),
+        body: requestBody,
       });
-      const rawBody = await res.text();
+
+    try {
+      let res = await postAnalyze();
+      let rawBody = await res.text();
+
+      if (rawBody.trim().startsWith('<') && !res.redirected) {
+        await new Promise((r) => setTimeout(r, 1400));
+        if (!ctrl.signal.aborted) {
+          const healthCheck = await fetch('/api/health', {
+            credentials: 'same-origin',
+            cache: 'no-store',
+            signal: ctrl.signal,
+          }).catch(() => null);
+          const healthCt = healthCheck?.headers.get('content-type') || '';
+          if (healthCheck?.ok && healthCt.includes('application/json')) {
+            res = await postAnalyze();
+            rawBody = await res.text();
+          }
+        }
+      }
+
       let data: any = null;
       try {
         data = rawBody ? JSON.parse(rawBody) : null;
       } catch {
-        const preview = rawBody.trim().slice(0, 80);
-        throw new Error(
-          preview.startsWith('<')
-            ? `AI backend unreachable (HTTP ${res.status}). Ensure /api/ai-analyze & GEMINI_API_KEY are configured.`
-            : `AI response format error (HTTP ${res.status})`
-        );
+        const trimmed = rawBody.trim();
+        if (trimmed.startsWith('<')) {
+          const titleMatch = trimmed.match(/<title[^>]*>([^<]{1,80})<\/title>/i);
+          const title = titleMatch ? titleMatch[1].trim() : '';
+          if (/nethaga/i.test(title)) {
+            throw new Error('Static SPA preview detected (no /api backend). Open Vercel deployment or full-stack server.');
+          }
+          if (res.redirected || /sign\s*in|google|auth|login/i.test(title)) {
+            throw new Error('Preview session expired in Safari iframe — reload Preview or open in a browser tab.');
+          }
+          throw new Error(
+            `AI backend unreachable (HTTP ${res.status}${title ? ` · ${title}` : ''}). Tap Retry.`
+          );
+        }
+        throw new Error(`AI response format error (HTTP ${res.status})`);
       }
       if (!res.ok) {
         if (res.status === 429) {
-          aiQuotaBackoffUntilRef.current = Date.now() + 60000;
+          aiQuotaBackoffUntilRef.current = Date.now() + 90000;
+        }
+        if ((res.status === 503 || res.status === 504) && stateRef.current.autoAi && aiAutoRetriedKeyRef.current !== dispatchKey) {
+          aiAutoRetriedKeyRef.current = dispatchKey;
+          if (aiAutoRetryTimerRef.current) clearTimeout(aiAutoRetryTimerRef.current);
+          aiAutoRetryTimerRef.current = setTimeout(() => {
+            if (stateRef.current.activeSymbol === sym && stateRef.current.currentTF === tf) {
+              runAiAnalysis(true, sig);
+            }
+          }, 4200);
+          throw new Error(`${data?.error || 'AI busy'} — retrying automatically…`);
         }
         throw new Error(data?.error || `HTTP ${res.status}`);
       }
       if (!ctrl.signal.aborted && data) {
         aiQuotaBackoffUntilRef.current = 0;
+        aiAutoRetriedKeyRef.current = '';
         const result = data as AiAnalysisResult;
         aiCacheRef.current[cacheKey] = { result, candleTime: sig.candleTime, fetchedAt: Date.now() };
         setAiAnalysis(result);
       }
     } catch (err: any) {
       if (timedOut) {
-        setAiError('AI request timed out (>22s) — tap Retry.');
+        setAiError('AI request timed out (>30s) — tap Retry.');
         return;
       }
       if (err?.name === 'AbortError' || ctrl.signal.aborted) return;
@@ -1360,6 +1423,7 @@ export default function App() {
       if (pendingWfTimerRef.current) clearTimeout(pendingWfTimerRef.current);
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
       if (aiDebounceTimerRef.current) clearTimeout(aiDebounceTimerRef.current);
+      if (aiAutoRetryTimerRef.current) clearTimeout(aiAutoRetryTimerRef.current);
       if (aiAbortRef.current) aiAbortRef.current.abort();
       if (signalRConnRef.current) signalRConnRef.current.stop().catch(() => {});
       if (backupWsRef.current) backupWsRef.current.close();
@@ -2494,6 +2558,11 @@ export default function App() {
                 setAutoAi((prev) => {
                   const next = !prev;
                   stateRef.current.autoAi = next;
+                  try {
+                    localStorage.setItem('nethaga_auto_ai_v1', String(next));
+                  } catch {
+                    // ignore
+                  }
                   if (next) runAiAnalysis(true);
                   return next;
                 })

@@ -119,6 +119,7 @@ export const AiAnalystCard: React.FC<AiAnalystCardProps> = ({
               </span>
             </div>
             <span className="font-mono text-[10px] text-slate-500">
+              {result.modelUsed ? `${result.modelUsed} · ` : ''}
               {new Date(result.analyzedAt).toLocaleTimeString('en-US', { hour12: false })}
             </span>
           </div>

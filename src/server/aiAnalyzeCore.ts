@@ -195,18 +195,87 @@ export function resolveGeminiApiKey(): string | null {
   return cleaned.length > 10 ? cleaned : null;
 }
 
+function resolveGroqApiKey(): string | null {
+  const raw = process.env.GROQ_API_KEY || '';
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '');
+  return cleaned.length > 10 ? cleaned : null;
+}
+
+function resolveOpenRouterApiKey(): string | null {
+  const raw = process.env.OPENROUTER_API_KEY || '';
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '');
+  return cleaned.length > 10 ? cleaned : null;
+}
+
+function normalizeAiPayload(
+  symbol: string,
+  tf: string,
+  parsed: Record<string, unknown>,
+  modelUsed: string
+): AiAnalyzeResponsePayload {
+  const rawBias = String(parsed.bias || 'WAIT').toUpperCase().trim();
+  const bias: 'BUY' | 'SELL' | 'WAIT' = rawBias === 'BUY' || rawBias === 'SELL' ? rawBias : 'WAIT';
+  const confidence = Math.max(0, Math.min(100, Math.round(Number(parsed.confidence) || 50)));
+  return {
+    symbol,
+    tf,
+    bias,
+    confidence,
+    setupType: String(parsed.setupType || 'Market Scan'),
+    srVerdict: String(parsed.srVerdict || '—'),
+    reversalAlert: String(parsed.reversalAlert || 'None'),
+    entryPlan: String(parsed.entryPlan || '—'),
+    riskNote: String(parsed.riskNote || '—'),
+    summary: String(parsed.summary || '—'),
+    analyzedAt: new Date().toISOString(),
+    modelUsed,
+  };
+}
+
+async function analyzeWithOpenAiCompatibleEndpoint(opts: {
+  url: string;
+  headers?: Record<string, string>;
+  body: Record<string, unknown>;
+  timeoutMs: number;
+  symbol: string;
+  tf: string;
+  modelLabel: string;
+}): Promise<{ ok: true; data: AiAnalyzeResponsePayload } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(opts.url, {
+      method: 'POST',
+      signal: AbortSignal.timeout(opts.timeoutMs),
+      headers: {
+        'Content-Type': 'application/json',
+        ...(opts.headers || {}),
+      },
+      body: JSON.stringify(opts.body),
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status };
+    }
+    const raw = await res.text();
+    const data = JSON.parse(raw);
+    const content = String(data?.choices?.[0]?.message?.content || data?.content || '');
+    if (!content.trim()) {
+      return { ok: false, status: 502 };
+    }
+    const parsed = extractJsonObject(content);
+    return {
+      ok: true,
+      data: normalizeAiPayload(opts.symbol, opts.tf, parsed, opts.modelLabel),
+    };
+  } catch {
+    return { ok: false, status: 504 };
+  }
+}
+
 export async function analyzeMarketWithGemini(
   rawBody: unknown
 ): Promise<{ ok: true; status: number; data: AiAnalyzeResponsePayload } | { ok: false; status: number; error: string }> {
   const apiKey = resolveGeminiApiKey();
-  if (!apiKey) {
-    return {
-      ok: false,
-      status: 503,
-      error:
-        'GEMINI_API_KEY not found on server. On Vercel: Settings → Environment Variables → add GEMINI_API_KEY (Production & Preview) → Redeploy.',
-    };
-  }
+  const groqKey = resolveGroqApiKey();
+  const openRouterKey = resolveOpenRouterApiKey();
 
   const body = rawBody as Partial<AiAnalyzeRequestBody> | null;
   if (!body || typeof body !== 'object') {
@@ -230,106 +299,77 @@ export async function analyzeMarketWithGemini(
     return { ok: false, status: 400, error: 'Insufficient live quote or candle context for AI analysis.' };
   }
 
-  const candles = body.recentCandles.slice(-24).map((c) => ({
-    t: String(c.t || '').slice(0, 19),
-    o: Number(c.o),
-    h: Number(c.h),
-    l: Number(c.l),
-    c: Number(c.c),
-  }));
-  const latestCandleTag = candles[candles.length - 1]?.t || '';
+  const candles = body.recentCandles.slice(-14).map((c) => [
+    String(c.t || '').slice(11, 16) || String(c.t || '').slice(0, 16),
+    Number(c.o),
+    Number(c.h),
+    Number(c.l),
+    Number(c.c),
+  ]);
+  const latestCandleTag = candles[candles.length - 1]?.[0] || '';
   const cacheKey = `${symbol}:${tf}:${lang}:${latestCandleTag}:${body.quantSignal?.state || ''}`;
   const cached = serverAiCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return { ok: true, status: 200, data: cached.payload };
   }
 
-  const aiClient = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      timeout: 12000,
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-
   const langInstruction =
     lang === 'kh'
-      ? 'Write all descriptive text fields (srVerdict, reversalAlert, entryPlan, riskNote, summary) in clear, natural Khmer (ភាសាខ្មែរ) with exact numbers.'
-      : 'Write all descriptive text fields (srVerdict, reversalAlert, entryPlan, riskNote, summary) in concise, actionable English with exact numbers.';
+      ? 'Write srVerdict, reversalAlert, entryPlan, riskNote, summary in concise Khmer (ភាសាខ្មែរ) under 18 words each using ONLY exact numbers from Snapshot.'
+      : 'Write srVerdict, reversalAlert, entryPlan, riskNote, summary in crisp English under 18 words each using ONLY exact numbers from Snapshot.';
 
   const promptPayload = {
-    symbol,
-    timeframe: tf,
-    liveQuote: body.quote,
-    keyLevels: body.keyLevels,
-    quantContext: body.quantSignal,
-    last24ClosedCandles: candles,
+    s: symbol,
+    tf,
+    q: body.quote,
+    lvl: body.keyLevels,
+    sig: body.quantSignal,
+    ohlc14: candles,
   };
+  const snapshotMessage = `Snapshot ${symbol} ${tf}:\n${JSON.stringify(promptPayload)}`;
 
-  const allModels = Array.from(
+  const allGeminiModels = Array.from(
     new Set([process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'])
   );
   const nowMs = Date.now();
-  const activeModels = allModels.filter((m) => (modelCooldownUntil.get(m) || 0) <= nowMs);
-  const baseModels = activeModels.length ? activeModels : allModels;
+  const activeGeminiModels = allGeminiModels.filter((m) => (modelCooldownUntil.get(m) || 0) <= nowMs);
 
-  let lastErr: { status: number; message: string } = { status: 503, message: 'Gemini AI temporarily busy.' };
+  let lastErr: { status: number; message: string } = { status: 503, message: 'All AI engines busy.' };
+  const attemptNotes: string[] = [];
+  const startedAt = Date.now();
 
-  for (let pass = 0; pass < 2; pass++) {
-    if (pass === 1) {
-      if (lastErr.status !== 503 && lastErr.status !== 504) break;
-      await new Promise((resolve) => setTimeout(resolve, 750));
-    }
-    const modelsToTry = pass === 0 ? baseModels : ['gemini-3.1-flash-lite'];
+  if (apiKey && activeGeminiModels.length > 0) {
+    const aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
 
-    for (const modelName of modelsToTry) {
+    for (const modelName of activeGeminiModels) {
+      if (Date.now() - startedAt > 18000) break;
+      const t0 = Date.now();
       try {
         const config: Record<string, unknown> = {
-          abortSignal: AbortSignal.timeout(11000),
+          abortSignal: AbortSignal.timeout(10500),
           systemInstruction:
-            `You are an institutional Forex, Gold & Crypto price-action & S/R quant analyst inside a fast trading terminal. ` +
-            `Evaluate the last 24 OHLC candles against R1/R2/S1/S2/PDH/PDL, EMA 8/21, MACD, RSI(14), ATR(14), and market structure. ` +
-            `Pay special attention to REVERSALS AT RESISTANCE (R1/R2/PDH rejection wicks, lower highs, RSI overbought turn) and REVERSALS AT SUPPORT (S1/S2/PDL bounce wicks, higher lows, RSI oversold turn), as well as clean trend continuation/breakouts. ` +
-            `Never invent prices outside the provided candles/levels. Keep every field crisp and under 25 words. ${langInstruction}`,
+            `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 ([HH:MM,O,H,L,C]) vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
+            `Highlight S/R rejections/bounces (reversals at R1/R2 or S1/S2) vs breakouts. Never invent prices. ${langInstruction}`,
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              bias: {
-                type: Type.STRING,
-                description: 'Must be exactly BUY, SELL, or WAIT.',
-              },
-              confidence: {
-                type: Type.INTEGER,
-                description: 'Confidence score from 0 to 100.',
-              },
-              setupType: {
-                type: Type.STRING,
-                description:
-                  'Short 2-4 word setup name, e.g. S1 Bounce Reversal, R1 Rejection Sell, EMA Trend Continuation, Squeeze Breakout.',
-              },
-              srVerdict: {
-                type: Type.STRING,
-                description: 'Concise assessment of current price position relative to S1/R1/PDH/PDL.',
-              },
-              reversalAlert: {
-                type: Type.STRING,
-                description: 'Whether price is currently reversing at R1/R2 or S1/S2, or None if trending cleanly.',
-              },
-              entryPlan: {
-                type: Type.STRING,
-                description: 'Immediate actionable plan: exact zone to enter/confirm and TP1/SL logic.',
-              },
-              riskNote: {
-                type: Type.STRING,
-                description: 'Key invalidation price or risk caution.',
-              },
-              summary: {
-                type: Type.STRING,
-                description: 'One-sentence synthesis of why BUY, SELL, or WAIT right now.',
-              },
+              bias: { type: Type.STRING, description: 'BUY, SELL, or WAIT.' },
+              confidence: { type: Type.INTEGER, description: '0 to 100.' },
+              setupType: { type: Type.STRING, description: '2-4 word setup name.' },
+              srVerdict: { type: Type.STRING, description: 'Price vs S1/R1/PDH/PDL.' },
+              reversalAlert: { type: Type.STRING, description: 'Reversal at R1/R2/S1/S2 or None.' },
+              entryPlan: { type: Type.STRING, description: 'Exact entry zone, TP1, SL.' },
+              riskNote: { type: Type.STRING, description: 'Invalidation price.' },
+              summary: { type: Type.STRING, description: 'One-sentence verdict.' },
             },
             required: ['bias', 'confidence', 'setupType', 'srVerdict', 'reversalAlert', 'entryPlan', 'riskNote', 'summary'],
           },
@@ -341,31 +381,14 @@ export async function analyzeMarketWithGemini(
 
         const response = await aiClient.models.generateContent({
           model: modelName,
-          contents: `Analyze this live market snapshot for ${symbol} on ${tf} and give a fast, decisive trading verdict:\n${JSON.stringify(promptPayload)}`,
+          contents: snapshotMessage,
           config: config as any,
         });
 
         const parsed = extractJsonObject(response.text ?? '{}');
-        const rawBias = String(parsed.bias || 'WAIT').toUpperCase().trim();
-        const bias: 'BUY' | 'SELL' | 'WAIT' = rawBias === 'BUY' || rawBias === 'SELL' ? rawBias : 'WAIT';
-        const confidence = Math.max(0, Math.min(100, Math.round(Number(parsed.confidence) || 50)));
+        const payload = normalizeAiPayload(symbol, tf, parsed, modelName);
 
-        const payload: AiAnalyzeResponsePayload = {
-          symbol,
-          tf,
-          bias,
-          confidence,
-          setupType: String(parsed.setupType || 'Market Scan'),
-          srVerdict: String(parsed.srVerdict || '—'),
-          reversalAlert: String(parsed.reversalAlert || 'None'),
-          entryPlan: String(parsed.entryPlan || '—'),
-          riskNote: String(parsed.riskNote || '—'),
-          summary: String(parsed.summary || '—'),
-          analyzedAt: new Date().toISOString(),
-          modelUsed: modelName,
-        };
-
-        serverAiCache.set(cacheKey, { payload, expiresAt: Date.now() + 35000 });
+        serverAiCache.set(cacheKey, { payload, expiresAt: Date.now() + 120000 });
         if (serverAiCache.size > 60) {
           const oldestKey = serverAiCache.keys().next().value;
           if (oldestKey) serverAiCache.delete(oldestKey);
@@ -373,16 +396,164 @@ export async function analyzeMarketWithGemini(
 
         return { ok: true, status: 200, data: payload };
       } catch (err) {
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
         const formatted = formatGeminiError(err);
         lastErr = { status: formatted.status, message: formatted.message };
+        attemptNotes.push(`${modelName}:${formatted.status}(${elapsed}s)`);
         if (formatted.retryableWithFallback) {
-          modelCooldownUntil.set(modelName, Date.now() + (formatted.status === 429 ? 45000 : 180000));
+          modelCooldownUntil.set(modelName, Date.now() + (formatted.status === 429 ? 65000 : 120000));
           continue;
         }
-        return { ok: false, status: formatted.status, error: formatted.message };
       }
     }
+  } else if (apiKey) {
+    attemptNotes.push('gemini:cooldown');
   }
 
-  return { ok: false, status: lastErr.status, error: lastErr.message };
+  // Fallback 1: Groq (optional fast key)
+  if (groqKey && (modelCooldownUntil.get('groq') || 0) <= Date.now() && Date.now() - startedAt < 21000) {
+    const t0 = Date.now();
+    const groqModel = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+    const groqRes = await analyzeWithOpenAiCompatibleEndpoint({
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      headers: { Authorization: `Bearer ${groqKey}` },
+      timeoutMs: 7500,
+      symbol,
+      tf,
+      modelLabel: `groq:${groqModel}`,
+      body: {
+        model: groqModel,
+        temperature: 0.2,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 ([HH:MM,O,H,L,C]) vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
+              `Highlight S/R rejections/bounces vs breakouts. Never invent prices. ${langInstruction} ` +
+              `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary.`,
+          },
+          { role: 'user', content: snapshotMessage },
+        ],
+      },
+    });
+    if (groqRes.ok) {
+      serverAiCache.set(cacheKey, { payload: groqRes.data, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: groqRes.data };
+    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    attemptNotes.push(`groq:${groqRes.status}(${elapsed}s)`);
+    modelCooldownUntil.set('groq', Date.now() + 60000);
+  }
+
+  // Fallback 2: OpenRouter free-tier models (optional free key)
+  if (openRouterKey && (modelCooldownUntil.get('openrouter') || 0) <= Date.now() && Date.now() - startedAt < 21000) {
+    const t0 = Date.now();
+    const orModel = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free';
+    const orRes = await analyzeWithOpenAiCompatibleEndpoint({
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      headers: {
+        Authorization: `Bearer ${openRouterKey}`,
+        'X-Title': 'NETHAGA PRO',
+      },
+      timeoutMs: 8500,
+      symbol,
+      tf,
+      modelLabel: `openrouter:${orModel.split('/').pop() || 'free'}`,
+      body: {
+        model: orModel,
+        temperature: 0.2,
+        messages: [
+          {
+            role: 'system',
+            content:
+              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
+              `Never invent prices. ${langInstruction} ` +
+              `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary.`,
+          },
+          { role: 'user', content: snapshotMessage },
+        ],
+      },
+    });
+    if (orRes.ok) {
+      serverAiCache.set(cacheKey, { payload: orRes.data, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: orRes.data };
+    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    attemptNotes.push(`openrouter:${orRes.status}(${elapsed}s)`);
+    modelCooldownUntil.set('openrouter', Date.now() + 60000);
+  }
+
+  // Fallback 3: Free keyless OVHcloud AI Endpoint (Meta-Llama-3.3-70B-Instruct)
+  if ((modelCooldownUntil.get('ovh-llama') || 0) <= Date.now() && Date.now() - startedAt < 21000) {
+    const t0 = Date.now();
+    const ovhRes = await analyzeWithOpenAiCompatibleEndpoint({
+      url: 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions',
+      timeoutMs: 6500,
+      symbol,
+      tf,
+      modelLabel: 'ovh:Llama-3.3-70B',
+      body: {
+        model: 'Meta-Llama-3_3-70B-Instruct',
+        temperature: 0.2,
+        max_tokens: 480,
+        messages: [
+          {
+            role: 'system',
+            content:
+              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
+              `Never invent prices. ${langInstruction} ` +
+              `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary.`,
+          },
+          { role: 'user', content: snapshotMessage },
+        ],
+      },
+    });
+    if (ovhRes.ok) {
+      serverAiCache.set(cacheKey, { payload: ovhRes.data, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: ovhRes.data };
+    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    attemptNotes.push(`ovh:${ovhRes.status}(${elapsed}s)`);
+    modelCooldownUntil.set('ovh-llama', Date.now() + (ovhRes.status === 429 ? 65000 : 45000));
+  }
+
+  // Fallback 4: Free keyless Pollinations AI (gpt-oss-20b; crisp English exact-number mode so no mangled numbers)
+  if ((modelCooldownUntil.get('pollinations') || 0) <= Date.now() && Date.now() - startedAt < 23000) {
+    const t0 = Date.now();
+    const pollRes = await analyzeWithOpenAiCompatibleEndpoint({
+      url: 'https://text.pollinations.ai/openai',
+      timeoutMs: 12000,
+      symbol,
+      tf,
+      modelLabel: 'pollinations:gpt-oss-20b',
+      body: {
+        model: 'openai',
+        jsonMode: true,
+        private: true,
+        messages: [
+          {
+            role: 'system',
+            content:
+              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Strictly use ONLY exact numbers from Snapshot (never invent prices or lots). ` +
+              `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary. Write crisp English under 18 words per field.`,
+          },
+          { role: 'user', content: snapshotMessage },
+        ],
+      },
+    });
+    if (pollRes.ok) {
+      serverAiCache.set(cacheKey, { payload: pollRes.data, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: pollRes.data };
+    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    attemptNotes.push(`pollinations:${pollRes.status}(${elapsed}s)`);
+    modelCooldownUntil.set('pollinations', Date.now() + 25000);
+  }
+
+  return {
+    ok: false,
+    status: lastErr.status,
+    error: attemptNotes.length ? `${lastErr.message} [${attemptNotes.join(', ')}]` : lastErr.message,
+  };
 }
