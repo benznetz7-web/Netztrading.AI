@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
@@ -74,6 +75,7 @@ const VALID_TF_SET = new Set(['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'])
 
 async function startServer() {
   const app = express();
+  const httpServer = http.createServer(app);
   app.use(express.json({ limit: '256kb' }));
 
   app.get('/api/health', (_req, res) => {
@@ -211,7 +213,10 @@ async function startServer() {
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -223,7 +228,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`NETHAGA server running on http://0.0.0.0:${PORT}`);
   });
 }
