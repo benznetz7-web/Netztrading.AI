@@ -90,36 +90,87 @@ async function fetchSwissquoteSingle(sym: string, instr: string): Promise<Fallba
     const arr = await fetchJsonWithTimeout(
       `https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/${instr}`,
       { Accept: 'application/json' },
-      7000
+      6000
     );
     if (!Array.isArray(arr) || !arr.length) return null;
-    const item = arr[0];
-    const prices = Array.isArray(item?.spreadProfilePrices) ? item.spreadProfilePrices : [];
-    const pick =
-      prices.find((p: any) => p?.spreadProfile === 'prime') ||
-      prices.find((p: any) => p?.spreadProfile === 'standard') ||
-      prices[0];
-    const bid = Number(pick?.bid);
-    const ask = Number(pick?.ask);
-    if (!(bid > 0) || !(ask >= bid)) return null;
-    const ts = Number(item?.ts) || Date.now();
-    return {
-      symbol: sym,
-      bid,
-      ask,
-      mid: (bid + ask) / 2,
-      spread: ask - bid,
-      timestamp: new Date(ts).toISOString(),
-      source: 'SWISSQUOTE',
-      marketState: 'open',
-    };
+
+    let bestQuote: FallbackQuote | null = null;
+    for (const item of arr) {
+      const prices = Array.isArray(item?.spreadProfilePrices) ? item.spreadProfilePrices : [];
+      if (!prices.length) continue;
+      const pick =
+        prices.find((p: any) => p?.spreadProfile === 'elite') ||
+        prices.find((p: any) => p?.spreadProfile === 'prime') ||
+        prices.find((p: any) => p?.spreadProfile === 'standard') ||
+        prices[0];
+      const bid = Number(pick?.bid);
+      const ask = Number(pick?.ask);
+      if (!(bid > 0) || !(ask >= bid)) continue;
+      const ts = Number(item?.ts) || Date.now();
+      const candidate: FallbackQuote = {
+        symbol: sym,
+        bid,
+        ask,
+        mid: (bid + ask) / 2,
+        spread: ask - bid,
+        timestamp: new Date(ts).toISOString(),
+        source: 'SWISSQUOTE',
+        marketState: 'open',
+      };
+      if (
+        !bestQuote ||
+        ts > Date.parse(bestQuote.timestamp) ||
+        (ts === Date.parse(bestQuote.timestamp) && candidate.spread < bestQuote.spread)
+      ) {
+        bestQuote = candidate;
+      }
+    }
+    return bestQuote;
   } catch {
     return null;
   }
 }
 
-export async function fetchFallbackQuotes(): Promise<Record<string, FallbackQuote>> {
+export async function fetchFallbackQuotes(onlySymbol?: string): Promise<Record<string, FallbackQuote>> {
   const out: Record<string, FallbackQuote> = {};
+  const target = String(onlySymbol || '').toUpperCase().trim();
+
+  if (target) {
+    if (SWISSQUOTE_MAP[target]) {
+      const q = await fetchSwissquoteSingle(target, SWISSQUOTE_MAP[target]);
+      if (q) out[target] = q;
+      return out;
+    }
+    if (KRAKEN_PAIR_MAP[target]) {
+      try {
+        const cfg = KRAKEN_PAIR_MAP[target];
+        const data = await fetchJsonWithTimeout(`https://api.kraken.com/0/public/Ticker?pair=${cfg.req}`, {}, 6000);
+        const resObj = data?.result || {};
+        const hitKey = cfg.resKeys.find((k) => resObj[k]);
+        const row = hitKey ? resObj[hitKey] : null;
+        if (row) {
+          const bid = Number(row.b?.[0]);
+          const ask = Number(row.a?.[0]);
+          if (bid > 0 && ask >= bid) {
+            out[target] = {
+              symbol: target,
+              bid,
+              ask,
+              mid: (bid + ask) / 2,
+              spread: ask - bid,
+              timestamp: new Date().toISOString(),
+              source: 'KRAKEN',
+              marketState: 'open',
+            };
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return out;
+    }
+    return out;
+  }
 
   const sqPromises = Object.entries(SWISSQUOTE_MAP).map(async ([sym, instr]) => {
     const q = await fetchSwissquoteSingle(sym, instr);
@@ -131,7 +182,7 @@ export async function fetchFallbackQuotes(): Promise<Record<string, FallbackQuot
       const pairs = Object.values(KRAKEN_PAIR_MAP)
         .map((x) => x.req)
         .join(',');
-      const data = await fetchJsonWithTimeout(`https://api.kraken.com/0/public/Ticker?pair=${pairs}`, {}, 8000);
+      const data = await fetchJsonWithTimeout(`https://api.kraken.com/0/public/Ticker?pair=${pairs}`, {}, 7000);
       const resObj = data?.result || {};
       const nowIso = new Date().toISOString();
       for (const [sym, cfg] of Object.entries(KRAKEN_PAIR_MAP)) {

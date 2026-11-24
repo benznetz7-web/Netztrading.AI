@@ -236,6 +236,8 @@ export default function App() {
   const candleRetryTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aiAbortRef = useRef<AbortController | null>(null);
+  const aiInFlightKeyRef = useRef<string | null>(null);
+  const aiQuotaBackoffUntilRef = useRef<number>(0);
   const aiDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAiDispatchRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
   const aiCacheRef = useRef<Record<string, { result: AiAnalysisResult; candleTime: number; fetchedAt: number }>>({});
@@ -244,6 +246,9 @@ export default function App() {
   const signalRStateRef = useRef<string>('DISCONNECTED');
   const isConnectingSrRef = useRef<boolean>(false);
   const subscribedKeyRef = useRef<string>('');
+  const backupWsRef = useRef<WebSocket | null>(null);
+  const backupWsStateRef = useRef<'DISCONNECTED' | 'CONNECTING' | 'CONNECTED'>('DISCONNECTED');
+  const wsUiThrottleRef = useRef<number>(0);
 
   // Mirror latest UI state into refs for callbacks
   const stateRef = useRef({
@@ -550,27 +555,40 @@ export default function App() {
     if (!quote || !bundle || bundle.closedBars.length < 10) return;
 
     const cacheKey = `${sym}:${tf}:${lng}`;
+    const dispatchKey = `${cacheKey}:${sig.candleTime}`;
     const cached = aiCacheRef.current[cacheKey];
     const now = Date.now();
 
     if (!force) {
+      if (now < aiQuotaBackoffUntilRef.current) {
+        return;
+      }
       if (cached && cached.candleTime === sig.candleTime && now - cached.fetchedAt < 180000) {
         setAiAnalysis(cached.result);
         setAiError(null);
         return;
       }
-      if (now - lastAiDispatchRef.current.at < 45000) {
+      if (aiInFlightKeyRef.current === dispatchKey) {
+        return;
+      }
+      if (lastAiDispatchRef.current.key === dispatchKey && now - lastAiDispatchRef.current.at < 45000) {
         return;
       }
     }
 
-    const dispatchKey = `${cacheKey}:${sig.candleTime}`;
     lastAiDispatchRef.current = { key: dispatchKey, at: now };
     if (aiAbortRef.current) {
       aiAbortRef.current.abort();
     }
     const ctrl = new AbortController();
     aiAbortRef.current = ctrl;
+    aiInFlightKeyRef.current = dispatchKey;
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, 26000);
+
     setAiLoading(true);
     setAiError(null);
 
@@ -638,17 +656,29 @@ export default function App() {
             : `AI response format error (HTTP ${res.status})`
         );
       }
-      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      if (!res.ok) {
+        if (res.status === 429) {
+          aiQuotaBackoffUntilRef.current = Date.now() + 60000;
+        }
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
       if (!ctrl.signal.aborted && data) {
+        aiQuotaBackoffUntilRef.current = 0;
         const result = data as AiAnalysisResult;
         aiCacheRef.current[cacheKey] = { result, candleTime: sig.candleTime, fetchedAt: Date.now() };
         setAiAnalysis(result);
       }
     } catch (err: any) {
+      if (timedOut) {
+        setAiError('AI request timed out (>22s) — tap Retry.');
+        return;
+      }
       if (err?.name === 'AbortError' || ctrl.signal.aborted) return;
       setAiError(err?.message || 'AI analysis unavailable');
     } finally {
+      clearTimeout(timeoutId);
       if (aiAbortRef.current === ctrl) {
+        aiInFlightKeyRef.current = null;
         setAiLoading(false);
       }
     }
@@ -657,6 +687,18 @@ export default function App() {
   const scheduleAutoAi = useCallback(
     (sig: SignalOutput) => {
       if (!stateRef.current.autoAi) return;
+      const sym = sig.asset || stateRef.current.activeSymbol;
+      const tf = sig.tf || stateRef.current.currentTF;
+      const lng = stateRef.current.lang;
+      const cacheKey = `${sym}:${tf}:${lng}`;
+      const dispatchKey = `${cacheKey}:${sig.candleTime}`;
+      const cached = aiCacheRef.current[cacheKey];
+      if (cached && cached.candleTime === sig.candleTime && Date.now() - cached.fetchedAt < 180000) {
+        setAiAnalysis(cached.result);
+        setAiError(null);
+        return;
+      }
+      if (aiInFlightKeyRef.current === dispatchKey) return;
       if (aiDebounceTimerRef.current) clearTimeout(aiDebounceTimerRef.current);
       aiDebounceTimerRef.current = setTimeout(() => {
         runAiAnalysis(false, sig);
@@ -850,6 +892,15 @@ export default function App() {
       });
       conn.onreconnected(async () => {
         signalRStateRef.current = 'CONNECTED';
+        if (backupWsRef.current) {
+          try {
+            backupWsRef.current.close();
+          } catch {
+            // ignore
+          }
+          backupWsRef.current = null;
+          backupWsStateRef.current = 'DISCONNECTED';
+        }
         await subscribeActiveBiquoteSymbols(conn, true);
         setStatusMessage('BIQUOTE · Live');
         setStatusLevel('ok');
@@ -859,7 +910,13 @@ export default function App() {
         subscribedKeyRef.current = '';
         if (stateRef.current.provider === 'BIQUOTE') {
           const isBackup = getActiveFeedMode() === 'BACKUP';
-          setStatusMessage(isBackup ? 'Backup Feed · Live' : 'SignalR off — polling');
+          setStatusMessage(
+            isBackup
+              ? backupWsStateRef.current === 'CONNECTED'
+                ? 'Backup WS · Live'
+                : 'Backup · Live'
+              : 'SignalR off — polling'
+          );
           setStatusLevel(isBackup ? 'ok' : 'warn');
         }
       });
@@ -867,17 +924,172 @@ export default function App() {
       signalRConnRef.current = conn;
       await conn.start();
       signalRStateRef.current = 'CONNECTED';
+      if (backupWsRef.current) {
+        try {
+          backupWsRef.current.close();
+        } catch {
+          // ignore
+        }
+        backupWsRef.current = null;
+        backupWsStateRef.current = 'DISCONNECTED';
+      }
       await subscribeActiveBiquoteSymbols(conn, true);
       setStatusMessage('BIQUOTE · Live');
       setStatusLevel('ok');
     } catch {
       signalRStateRef.current = 'POLLING';
-      setStatusMessage(getActiveFeedMode() === 'BACKUP' ? 'Backup Feed · Live' : 'BIQUOTE · Polling');
+      setStatusMessage(
+        getActiveFeedMode() === 'BACKUP'
+          ? backupWsStateRef.current === 'CONNECTED'
+            ? 'Backup WS · Live'
+            : 'Backup · Live'
+          : 'BIQUOTE · Polling'
+      );
       setStatusLevel('ok');
     } finally {
       isConnectingSrRef.current = false;
     }
   }, [evaluateActiveLockOnTick, getLockKey, scheduleTickEvaluation, subscribeActiveBiquoteSymbols]);
+
+  const disconnectBackupCryptoWs = useCallback(() => {
+    if (backupWsRef.current) {
+      try {
+        backupWsRef.current.close();
+      } catch {
+        // ignore
+      }
+      backupWsRef.current = null;
+    }
+    backupWsStateRef.current = 'DISCONNECTED';
+  }, []);
+
+  const connectBackupCryptoWs = useCallback(() => {
+    if (
+      stateRef.current.provider !== 'BIQUOTE' ||
+      signalRStateRef.current === 'CONNECTED' ||
+      backupWsStateRef.current !== 'DISCONNECTED'
+    ) {
+      return;
+    }
+    const KRAKEN_WS_TO_SYM: Record<string, string> = {
+      'BTC/USD': 'BTCUSD',
+      'ETH/USD': 'ETHUSD',
+      'SOL/USD': 'SOLUSD',
+      'XRP/USD': 'XRPUSD',
+      'BNB/USD': 'BNBUSD',
+      'LTC/USD': 'LTCUSD',
+    };
+    try {
+      backupWsStateRef.current = 'CONNECTING';
+      const ws = new WebSocket('wss://ws.kraken.com/v2');
+      backupWsRef.current = ws;
+
+      ws.onopen = () => {
+        if (backupWsRef.current !== ws || stateRef.current.provider !== 'BIQUOTE') {
+          ws.close();
+          return;
+        }
+        backupWsStateRef.current = 'CONNECTED';
+        ws.send(
+          JSON.stringify({
+            method: 'subscribe',
+            params: {
+              channel: 'ticker',
+              event_trigger: 'bbo',
+              symbol: Object.keys(KRAKEN_WS_TO_SYM),
+            },
+          })
+        );
+        if (signalRStateRef.current !== 'CONNECTED' && getActiveFeedMode() === 'BACKUP') {
+          setStatusMessage('Backup WS · Live');
+          setStatusLevel('ok');
+        }
+      };
+
+      ws.onmessage = (evt) => {
+        if (stateRef.current.provider !== 'BIQUOTE' || signalRStateRef.current === 'CONNECTED') return;
+        let msg: any = null;
+        try {
+          msg = JSON.parse(String(evt.data));
+        } catch {
+          return;
+        }
+        if (msg?.channel !== 'ticker' || !Array.isArray(msg.data)) return;
+
+        let activeUpdated = false;
+        let anyAccepted = false;
+        const nowIso = new Date().toISOString();
+
+        for (const item of msg.data) {
+          const sym = KRAKEN_WS_TO_SYM[String(item?.symbol || '').toUpperCase()];
+          if (!sym) continue;
+          const bid = Number(item.bid);
+          const ask = Number(item.ask);
+          if (!(bid > 0) || !(ask >= bid)) continue;
+
+          const prevMid = quotesRef.current.BIQUOTE?.[sym]?.mid || 0;
+          const res = ingestQuoteUpdate(
+            quotesRef.current,
+            sym,
+            {
+              bid,
+              ask,
+              dayDiffPercent: Number.isFinite(Number(item.change_pct)) ? Number(item.change_pct) : null,
+              timestamp: nowIso,
+              source: 'KRAKEN WS',
+              marketState: 'open',
+            },
+            'BIQUOTE',
+            true
+          );
+          if (!res.accepted || !res.quote) continue;
+          anyAccepted = true;
+
+          if (sym === stateRef.current.activeSymbol) {
+            activeUpdated = true;
+            if (prevMid && res.quote.mid > prevMid) setTickPulseDir('up');
+            else if (prevMid && res.quote.mid < prevMid) setTickPulseDir('down');
+            else setTickPulseDir('flat');
+
+            evaluateActiveLockOnTick(res.quote);
+
+            const c = candlesCacheRef.current[`BIQUOTE:${sym}:${stateRef.current.currentTF}`];
+            if (c?.formingBar) {
+              c.formingBar.close = res.quote.mid;
+              c.formingBar.high = Math.max(c.formingBar.high, res.quote.mid);
+              c.formingBar.low = Math.min(c.formingBar.low, res.quote.mid);
+            }
+            if (!activeLocksRef.current[getLockKey()]) {
+              scheduleTickEvaluation();
+            }
+          }
+        }
+
+        if (anyAccepted) {
+          const now = Date.now();
+          if (activeUpdated || now - wsUiThrottleRef.current >= 180) {
+            wsUiThrottleRef.current = now;
+            setQuoteRenderSeq((n) => (n + 1) % 1000000);
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        if (backupWsRef.current === ws) {
+          backupWsStateRef.current = 'DISCONNECTED';
+        }
+      };
+
+      ws.onclose = () => {
+        if (backupWsRef.current === ws) {
+          backupWsRef.current = null;
+          backupWsStateRef.current = 'DISCONNECTED';
+        }
+      };
+    } catch {
+      backupWsStateRef.current = 'DISCONNECTED';
+    }
+  }, [evaluateActiveLockOnTick, getLockKey, scheduleTickEvaluation]);
 
   const checkExnessBridge = useCallback(
     async (runAnalysis = true) => {
@@ -956,10 +1168,92 @@ export default function App() {
     });
   }, [analyzeActiveMarket]);
 
-  // Provider bootstrap & polling timers
+  // Provider bootstrap & adaptive ultra-fast tick loop
   useEffect(() => {
-    let fallbackPollId: ReturnType<typeof setInterval> | null = null;
+    let fallbackPollTimer: ReturnType<typeof setTimeout> | null = null;
     let exnessPollId: ReturnType<typeof setInterval> | null = null;
+    let cancelled = false;
+    let pollCycle = 0;
+
+    const applyActiveQuoteTick = (mode: 'BIQUOTE' | 'BACKUP', prevMidMap: Record<string, number>) => {
+      const sym = stateRef.current.activeSymbol;
+      const q = quotesRef.current.BIQUOTE?.[sym];
+      const prevMid = prevMidMap[sym] || 0;
+      if (q) {
+        if (prevMid && q.mid > prevMid) setTickPulseDir('up');
+        else if (prevMid && q.mid < prevMid) setTickPulseDir('down');
+        else if (!prevMid) setTickPulseDir('flat');
+
+        evaluateActiveLockOnTick(q);
+        const c = candlesCacheRef.current[`BIQUOTE:${sym}:${stateRef.current.currentTF}`];
+        if (c?.formingBar) {
+          c.formingBar.close = q.mid;
+          c.formingBar.high = Math.max(c.formingBar.high, q.mid);
+          c.formingBar.low = Math.min(c.formingBar.low, q.mid);
+        }
+        if (!activeLocksRef.current[getLockKey()]) {
+          scheduleTickEvaluation();
+        }
+      }
+      if (signalRStateRef.current !== 'CONNECTED') {
+        setStatusMessage(
+          mode === 'BACKUP'
+            ? backupWsStateRef.current === 'CONNECTED'
+              ? 'Backup WS · Live'
+              : 'Backup · Live'
+            : 'BIQUOTE · Polling'
+        );
+        setStatusLevel('ok');
+      }
+    };
+
+    const runAdaptiveBackupLoop = async () => {
+      if (cancelled) return;
+      if (stateRef.current.provider === 'BIQUOTE' && signalRStateRef.current !== 'CONNECTED') {
+        pollCycle++;
+        const sym = stateRef.current.activeSymbol;
+        const isCrypto = SYMBOL_SPECS[sym]?.desk === 'CRYPTO';
+        const modeNow = getActiveFeedMode();
+
+        if (modeNow === 'BACKUP' && backupWsStateRef.current === 'DISCONNECTED') {
+          connectBackupCryptoWs();
+        }
+
+        const prevMidMap: Record<string, number> = {
+          [sym]: quotesRef.current.BIQUOTE?.[sym]?.mid || 0,
+        };
+
+        // Fetch only the active symbol on fast ticks (~280ms); sync all 14 symbols every 10th cycle
+        const wantAll = pollCycle % 10 === 0;
+        const onlySym = !wantAll && modeNow === 'BACKUP' && !isCrypto ? sym : undefined;
+
+        if (!(modeNow === 'BACKUP' && isCrypto && backupWsStateRef.current === 'CONNECTED' && !wantAll)) {
+          try {
+            const mode = await fetchBiquoteLatestSnapshot(quotesRef.current, onlySym);
+            if (!cancelled) {
+              if (mode === 'BACKUP' && backupWsStateRef.current === 'DISCONNECTED') {
+                connectBackupCryptoWs();
+              }
+              setQuoteRenderSeq((n) => (n + 1) % 1000000);
+              applyActiveQuoteTick(mode, prevMidMap);
+            }
+          } catch {
+            // ignore transient tick errors
+          }
+        }
+      }
+
+      if (cancelled) return;
+      const sym = stateRef.current.activeSymbol;
+      const isCrypto = SYMBOL_SPECS[sym]?.desk === 'CRYPTO';
+      const nextDelay =
+        signalRStateRef.current === 'CONNECTED'
+          ? 4000
+          : getActiveFeedMode() === 'BACKUP' && isCrypto && backupWsStateRef.current === 'CONNECTED'
+          ? 4500
+          : 700;
+      fallbackPollTimer = setTimeout(runAdaptiveBackupLoop, nextDelay);
+    };
 
     if (provider === 'BIQUOTE') {
       setStatusMessage('Connecting…');
@@ -967,48 +1261,25 @@ export default function App() {
       checkBiquoteActiveSymbols().catch(() => {});
       fetchBiquoteLatestSnapshot(quotesRef.current)
         .then((mode) => {
+          if (cancelled) return;
+          if (mode === 'BACKUP') connectBackupCryptoWs();
           setQuoteRenderSeq((n) => (n + 1) % 1000000);
           if (signalRStateRef.current !== 'CONNECTED') {
-            setStatusMessage(mode === 'BACKUP' ? 'Backup Feed · Live' : 'BIQUOTE · Polling');
+            setStatusMessage(mode === 'BACKUP' ? 'Backup WS · Live' : 'BIQUOTE · Polling');
             setStatusLevel('ok');
           }
           analyzeActiveMarket(true, false, stateRef.current.activeSymbol, stateRef.current.currentTF, 'BIQUOTE');
         })
         .catch((e: any) => {
+          if (cancelled) return;
           setStatusMessage(`ERR — ${e?.message || 'Failed'}`);
           setStatusLevel('err');
         });
       connectBiquoteSignalR();
       analyzeActiveMarket(true, true, activeSymbol, currentTF, 'BIQUOTE');
-
-      fallbackPollId = setInterval(() => {
-        if (stateRef.current.provider === 'BIQUOTE' && signalRStateRef.current !== 'CONNECTED') {
-          fetchBiquoteLatestSnapshot(quotesRef.current)
-            .then((mode) => {
-              setQuoteRenderSeq((n) => (n + 1) % 1000000);
-              if (signalRStateRef.current !== 'CONNECTED') {
-                setStatusMessage(mode === 'BACKUP' ? 'Backup Feed · Live' : 'BIQUOTE · Polling');
-                setStatusLevel('ok');
-              }
-              const sym = stateRef.current.activeSymbol;
-              const q = quotesRef.current.BIQUOTE?.[sym];
-              if (q) {
-                evaluateActiveLockOnTick(q);
-                const c = candlesCacheRef.current[`BIQUOTE:${sym}:${stateRef.current.currentTF}`];
-                if (c?.formingBar) {
-                  c.formingBar.close = q.mid;
-                  c.formingBar.high = Math.max(c.formingBar.high, q.mid);
-                  c.formingBar.low = Math.min(c.formingBar.low, q.mid);
-                }
-                if (!activeLocksRef.current[getLockKey()]) {
-                  scheduleTickEvaluation();
-                }
-              }
-            })
-            .catch(() => {});
-        }
-      }, 4000);
+      fallbackPollTimer = setTimeout(runAdaptiveBackupLoop, 750);
     } else {
+      disconnectBackupCryptoWs();
       if (signalRConnRef.current) {
         signalRConnRef.current.stop().catch(() => {});
         signalRConnRef.current = null;
@@ -1020,8 +1291,10 @@ export default function App() {
     }
 
     return () => {
-      if (fallbackPollId) clearInterval(fallbackPollId);
+      cancelled = true;
+      if (fallbackPollTimer) clearTimeout(fallbackPollTimer);
       if (exnessPollId) clearInterval(exnessPollId);
+      disconnectBackupCryptoWs();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
@@ -1048,13 +1321,21 @@ export default function App() {
     return () => clearInterval(id);
   }, [currentTF, showToast, triggerCandleCloseRefresh]);
 
-  // Auto-recover SignalR & live candles when returning from mobile Safari sleep/background
+  // Auto-recover SignalR, Backup WS & live candles when returning from mobile Safari sleep/background
   useEffect(() => {
     const handleWake = () => {
       if (document.visibilityState === 'hidden') return;
       if (stateRef.current.provider === 'BIQUOTE') {
         fetchBiquoteLatestSnapshot(quotesRef.current)
-          .then(() => setQuoteRenderSeq((n) => (n + 1) % 1000000))
+          .then((mode) => {
+            if (mode === 'BACKUP') {
+              if (backupWsRef.current && backupWsRef.current.readyState !== WebSocket.OPEN) {
+                disconnectBackupCryptoWs();
+              }
+              connectBackupCryptoWs();
+            }
+            setQuoteRenderSeq((n) => (n + 1) % 1000000);
+          })
           .catch(() => {});
         if (signalRStateRef.current !== 'CONNECTED') {
           connectBiquoteSignalR();
@@ -1070,7 +1351,7 @@ export default function App() {
       document.removeEventListener('visibilitychange', handleWake);
       window.removeEventListener('pageshow', handleWake);
     };
-  }, [analyzeActiveMarket, checkExnessBridge, connectBiquoteSignalR]);
+  }, [analyzeActiveMarket, checkExnessBridge, connectBackupCryptoWs, connectBiquoteSignalR, disconnectBackupCryptoWs]);
 
   useEffect(() => {
     return () => {
@@ -1081,6 +1362,7 @@ export default function App() {
       if (aiDebounceTimerRef.current) clearTimeout(aiDebounceTimerRef.current);
       if (aiAbortRef.current) aiAbortRef.current.abort();
       if (signalRConnRef.current) signalRConnRef.current.stop().catch(() => {});
+      if (backupWsRef.current) backupWsRef.current.close();
     };
   }, []);
 
@@ -1148,6 +1430,11 @@ export default function App() {
     const cachedAi = aiCacheRef.current[`${sym}:${currentTF}:${lang}`];
     setAiAnalysis(cachedAi?.result || null);
     setAiError(null);
+    if (provider === 'BIQUOTE' && getActiveFeedMode() === 'BACKUP' && desk === 'FOREX') {
+      fetchBiquoteLatestSnapshot(quotesRef.current, sym)
+        .then(() => setQuoteRenderSeq((n) => (n + 1) % 1000000))
+        .catch(() => {});
+    }
     analyzeActiveMarket(true, false, sym, currentTF, provider);
   };
 
@@ -1162,6 +1449,11 @@ export default function App() {
       const cachedAi = aiCacheRef.current[`${nextSym}:${currentTF}:${lang}`];
       setAiAnalysis(cachedAi?.result || null);
       setAiError(null);
+      if (provider === 'BIQUOTE' && getActiveFeedMode() === 'BACKUP' && desk === 'FOREX') {
+        fetchBiquoteLatestSnapshot(quotesRef.current, nextSym)
+          .then(() => setQuoteRenderSeq((n) => (n + 1) % 1000000))
+          .catch(() => {});
+      }
       analyzeActiveMarket(true, false, nextSym, currentTF, provider);
     }
   };

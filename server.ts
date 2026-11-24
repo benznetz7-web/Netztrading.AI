@@ -43,12 +43,14 @@ async function startServer() {
   });
 
   app.get('/api/market-fallback', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     const mode = Array.isArray(req.query?.mode) ? req.query.mode[0] : req.query?.mode;
     if (mode === 'quotes') {
-      const quotes = await fetchFallbackQuotes();
+      const symbol = String(Array.isArray(req.query?.symbol) ? req.query.symbol[0] : req.query?.symbol || '').trim();
+      const quotes = await fetchFallbackQuotes(symbol || undefined);
       const count = Object.keys(quotes).length;
       if (!count) {
-        res.status(502).json({ error: 'Backup quote providers unavailable' });
+        res.status(symbol ? 404 : 502).json({ error: 'Backup quote providers unavailable' });
         return;
       }
       res.json({ ok: true, count, quotes });

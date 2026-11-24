@@ -195,9 +195,11 @@ export async function checkBiquoteActiveSymbols(): Promise<Set<string>> {
 }
 
 export async function fetchBackupQuotesSnapshot(
-  quotesByProvider: QuotesByProvider
+  quotesByProvider: QuotesByProvider,
+  onlySymbol?: string
 ): Promise<{ count: number; sources: string[] }> {
-  const r = await safeFetch('/api/market-fallback?mode=quotes', {}, 12000);
+  const qs = onlySymbol ? `&symbol=${encodeURIComponent(onlySymbol)}` : '';
+  const r = await safeFetch(`/api/market-fallback?mode=quotes${qs}`, { cache: 'no-store' }, onlySymbol ? 6000 : 12000);
   const raw = await r.text();
   let parsed: any = null;
   try {
@@ -223,10 +225,11 @@ export async function fetchBackupQuotesSnapshot(
 }
 
 export async function fetchBiquoteLatestSnapshot(
-  quotesByProvider: QuotesByProvider
+  quotesByProvider: QuotesByProvider,
+  onlySymbol?: string
 ): Promise<'BIQUOTE' | 'BACKUP'> {
   if (typeof window !== 'undefined' && Date.now() < biquoteDownUntilMs) {
-    await fetchBackupQuotesSnapshot(quotesByProvider);
+    await fetchBackupQuotesSnapshot(quotesByProvider, onlySymbol);
     activeFeedMode = 'BACKUP';
     return 'BACKUP';
   }

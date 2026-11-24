@@ -66,8 +66,9 @@ export interface AiAnalyzeResponsePayload {
 const VALID_SYMBOL_RE = /^[A-Z0-9]{3,12}$/;
 const VALID_TF_SET = new Set(['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1']);
 
-// Short TTL in-memory cache (25s) to prevent quota exhaustion during rapid live updates
+// Short TTL in-memory cache (35s) and per-model failure cooldown (3m) so retries never stall on a degraded model
 const serverAiCache = new Map<string, { payload: AiAnalyzeResponsePayload; expiresAt: number }>();
+const modelCooldownUntil = new Map<string, number>();
 
 function extractJsonObject(raw: string): Record<string, unknown> {
   const cleaned = raw
@@ -90,8 +91,17 @@ function extractJsonObject(raw: string): Record<string, unknown> {
 
 function formatGeminiError(err: unknown): { status: number; message: string; retryableWithFallback: boolean } {
   const rawMsg = err instanceof Error ? err.message : String(err || 'Gemini AI analysis failed');
+  const errName = err instanceof Error ? err.name : '';
   let status = 502;
   let message = rawMsg;
+
+  if (errName === 'TimeoutError' || errName === 'AbortError' || rawMsg.toLowerCase().includes('aborted') || rawMsg.toLowerCase().includes('timeout')) {
+    return {
+      status: 504,
+      message: 'AI server busy (timeout). Please tap Retry.',
+      retryableWithFallback: true,
+    };
+  }
 
   try {
     const start = rawMsg.indexOf('{');
@@ -111,6 +121,13 @@ function formatGeminiError(err: unknown): { status: number; message: string; ret
         return {
           status: 502,
           message: apiMsg || 'Configured AI model unavailable.',
+          retryableWithFallback: true,
+        };
+      }
+      if (code === 400 || apiStatus === 'INVALID_ARGUMENT') {
+        return {
+          status: 400,
+          message: apiMsg || 'Invalid AI request configuration.',
           retryableWithFallback: true,
         };
       }
@@ -142,7 +159,16 @@ function formatGeminiError(err: unknown): { status: number; message: string; ret
   return {
     status,
     message: message.slice(0, 220),
-    retryableWithFallback: rawMsg.includes('404') || rawMsg.includes('NOT_FOUND') || rawMsg.includes('503'),
+    retryableWithFallback:
+      status === 503 ||
+      status === 500 ||
+      status === 504 ||
+      rawMsg.includes('404') ||
+      rawMsg.includes('NOT_FOUND') ||
+      rawMsg.includes('503') ||
+      rawMsg.includes('UNAVAILABLE') ||
+      rawMsg.includes('500') ||
+      rawMsg.includes('504'),
   };
 }
 
@@ -221,6 +247,7 @@ export async function analyzeMarketWithGemini(
   const aiClient = new GoogleGenAI({
     apiKey,
     httpOptions: {
+      timeout: 12000,
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -241,104 +268,117 @@ export async function analyzeMarketWithGemini(
     last24ClosedCandles: candles,
   };
 
-  const modelsToTry = Array.from(
-    new Set([process.env.GEMINI_MODEL || 'gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'])
+  const allModels = Array.from(
+    new Set([process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'])
   );
+  const nowMs = Date.now();
+  const activeModels = allModels.filter((m) => (modelCooldownUntil.get(m) || 0) <= nowMs);
+  const baseModels = activeModels.length ? activeModels : allModels;
 
-  let lastErr: { status: number; message: string } = { status: 502, message: 'Gemini AI analysis failed' };
+  let lastErr: { status: number; message: string } = { status: 503, message: 'Gemini AI temporarily busy.' };
 
-  for (const modelName of modelsToTry) {
-    try {
-      const config: Record<string, unknown> = {
-        systemInstruction:
-          `You are an institutional Forex, Gold & Crypto price-action & S/R quant analyst inside a fast trading terminal. ` +
-          `Evaluate the last 24 OHLC candles against R1/R2/S1/S2/PDH/PDL, EMA 8/21, MACD, RSI(14), ATR(14), and market structure. ` +
-          `Pay special attention to REVERSALS AT RESISTANCE (R1/R2/PDH rejection wicks, lower highs, RSI overbought turn) and REVERSALS AT SUPPORT (S1/S2/PDL bounce wicks, higher lows, RSI oversold turn), as well as clean trend continuation/breakouts. ` +
-          `Never invent prices outside the provided candles/levels. Keep every field crisp and under 25 words. ${langInstruction}`,
-        temperature: 0.2,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            bias: {
-              type: Type.STRING,
-              description: 'Must be exactly BUY, SELL, or WAIT.',
+  for (let pass = 0; pass < 2; pass++) {
+    if (pass === 1) {
+      if (lastErr.status !== 503 && lastErr.status !== 504) break;
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    }
+    const modelsToTry = pass === 0 ? baseModels : ['gemini-3.1-flash-lite'];
+
+    for (const modelName of modelsToTry) {
+      try {
+        const config: Record<string, unknown> = {
+          abortSignal: AbortSignal.timeout(11000),
+          systemInstruction:
+            `You are an institutional Forex, Gold & Crypto price-action & S/R quant analyst inside a fast trading terminal. ` +
+            `Evaluate the last 24 OHLC candles against R1/R2/S1/S2/PDH/PDL, EMA 8/21, MACD, RSI(14), ATR(14), and market structure. ` +
+            `Pay special attention to REVERSALS AT RESISTANCE (R1/R2/PDH rejection wicks, lower highs, RSI overbought turn) and REVERSALS AT SUPPORT (S1/S2/PDL bounce wicks, higher lows, RSI oversold turn), as well as clean trend continuation/breakouts. ` +
+            `Never invent prices outside the provided candles/levels. Keep every field crisp and under 25 words. ${langInstruction}`,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              bias: {
+                type: Type.STRING,
+                description: 'Must be exactly BUY, SELL, or WAIT.',
+              },
+              confidence: {
+                type: Type.INTEGER,
+                description: 'Confidence score from 0 to 100.',
+              },
+              setupType: {
+                type: Type.STRING,
+                description:
+                  'Short 2-4 word setup name, e.g. S1 Bounce Reversal, R1 Rejection Sell, EMA Trend Continuation, Squeeze Breakout.',
+              },
+              srVerdict: {
+                type: Type.STRING,
+                description: 'Concise assessment of current price position relative to S1/R1/PDH/PDL.',
+              },
+              reversalAlert: {
+                type: Type.STRING,
+                description: 'Whether price is currently reversing at R1/R2 or S1/S2, or None if trending cleanly.',
+              },
+              entryPlan: {
+                type: Type.STRING,
+                description: 'Immediate actionable plan: exact zone to enter/confirm and TP1/SL logic.',
+              },
+              riskNote: {
+                type: Type.STRING,
+                description: 'Key invalidation price or risk caution.',
+              },
+              summary: {
+                type: Type.STRING,
+                description: 'One-sentence synthesis of why BUY, SELL, or WAIT right now.',
+              },
             },
-            confidence: {
-              type: Type.INTEGER,
-              description: 'Confidence score from 0 to 100.',
-            },
-            setupType: {
-              type: Type.STRING,
-              description:
-                'Short 2-4 word setup name, e.g. S1 Bounce Reversal, R1 Rejection Sell, EMA Trend Continuation, Squeeze Breakout.',
-            },
-            srVerdict: {
-              type: Type.STRING,
-              description: 'Concise assessment of current price position relative to S1/R1/PDH/PDL.',
-            },
-            reversalAlert: {
-              type: Type.STRING,
-              description: 'Whether price is currently reversing at R1/R2 or S1/S2, or None if trending cleanly.',
-            },
-            entryPlan: {
-              type: Type.STRING,
-              description: 'Immediate actionable plan: exact zone to enter/confirm and TP1/SL logic.',
-            },
-            riskNote: {
-              type: Type.STRING,
-              description: 'Key invalidation price or risk caution.',
-            },
-            summary: {
-              type: Type.STRING,
-              description: 'One-sentence synthesis of why BUY, SELL, or WAIT right now.',
-            },
+            required: ['bias', 'confidence', 'setupType', 'srVerdict', 'reversalAlert', 'entryPlan', 'riskNote', 'summary'],
           },
-          required: ['bias', 'confidence', 'setupType', 'srVerdict', 'reversalAlert', 'entryPlan', 'riskNote', 'summary'],
-        },
-      };
+        };
 
-      if (modelName === 'gemini-4-hydrogen') {
-        config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-      }
+        if (modelName === 'gemini-4-hydrogen') {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        }
 
-      const response = await aiClient.models.generateContent({
-        model: modelName,
-        contents: `Analyze this live market snapshot for ${symbol} on ${tf} and give a fast, decisive trading verdict:\n${JSON.stringify(promptPayload)}`,
-        config: config as any,
-      });
+        const response = await aiClient.models.generateContent({
+          model: modelName,
+          contents: `Analyze this live market snapshot for ${symbol} on ${tf} and give a fast, decisive trading verdict:\n${JSON.stringify(promptPayload)}`,
+          config: config as any,
+        });
 
-      const parsed = extractJsonObject(response.text ?? '{}');
-      const rawBias = String(parsed.bias || 'WAIT').toUpperCase().trim();
-      const bias: 'BUY' | 'SELL' | 'WAIT' = rawBias === 'BUY' || rawBias === 'SELL' ? rawBias : 'WAIT';
-      const confidence = Math.max(0, Math.min(100, Math.round(Number(parsed.confidence) || 50)));
+        const parsed = extractJsonObject(response.text ?? '{}');
+        const rawBias = String(parsed.bias || 'WAIT').toUpperCase().trim();
+        const bias: 'BUY' | 'SELL' | 'WAIT' = rawBias === 'BUY' || rawBias === 'SELL' ? rawBias : 'WAIT';
+        const confidence = Math.max(0, Math.min(100, Math.round(Number(parsed.confidence) || 50)));
 
-      const payload: AiAnalyzeResponsePayload = {
-        symbol,
-        tf,
-        bias,
-        confidence,
-        setupType: String(parsed.setupType || 'Market Scan'),
-        srVerdict: String(parsed.srVerdict || '—'),
-        reversalAlert: String(parsed.reversalAlert || 'None'),
-        entryPlan: String(parsed.entryPlan || '—'),
-        riskNote: String(parsed.riskNote || '—'),
-        summary: String(parsed.summary || '—'),
-        analyzedAt: new Date().toISOString(),
-        modelUsed: modelName,
-      };
+        const payload: AiAnalyzeResponsePayload = {
+          symbol,
+          tf,
+          bias,
+          confidence,
+          setupType: String(parsed.setupType || 'Market Scan'),
+          srVerdict: String(parsed.srVerdict || '—'),
+          reversalAlert: String(parsed.reversalAlert || 'None'),
+          entryPlan: String(parsed.entryPlan || '—'),
+          riskNote: String(parsed.riskNote || '—'),
+          summary: String(parsed.summary || '—'),
+          analyzedAt: new Date().toISOString(),
+          modelUsed: modelName,
+        };
 
-      serverAiCache.set(cacheKey, { payload, expiresAt: Date.now() + 25000 });
-      if (serverAiCache.size > 60) {
-        const oldestKey = serverAiCache.keys().next().value;
-        if (oldestKey) serverAiCache.delete(oldestKey);
-      }
+        serverAiCache.set(cacheKey, { payload, expiresAt: Date.now() + 35000 });
+        if (serverAiCache.size > 60) {
+          const oldestKey = serverAiCache.keys().next().value;
+          if (oldestKey) serverAiCache.delete(oldestKey);
+        }
 
-      return { ok: true, status: 200, data: payload };
-    } catch (err) {
-      const formatted = formatGeminiError(err);
-      lastErr = { status: formatted.status, message: formatted.message };
-      if (!formatted.retryableWithFallback) {
+        return { ok: true, status: 200, data: payload };
+      } catch (err) {
+        const formatted = formatGeminiError(err);
+        lastErr = { status: formatted.status, message: formatted.message };
+        if (formatted.retryableWithFallback) {
+          modelCooldownUntil.set(modelName, Date.now() + (formatted.status === 429 ? 45000 : 180000));
+          continue;
+        }
         return { ok: false, status: formatted.status, error: formatted.message };
       }
     }

@@ -2,6 +2,7 @@ import { fetchFallbackCandles, fetchFallbackQuotes } from '../src/server/marketF
 
 export default async function handler(req: any, res: any) {
   res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
   if (req.method !== 'GET') {
     res.status(405).json({ error: 'Method not allowed.' });
     return;
@@ -9,8 +10,14 @@ export default async function handler(req: any, res: any) {
 
   const mode = String(Array.isArray(req.query?.mode) ? req.query.mode[0] : req.query?.mode || 'quotes');
   if (mode === 'quotes') {
-    const quotes = await fetchFallbackQuotes();
-    res.status(200).json({ source: 'BACKUP (SWISSQUOTE/KRAKEN)', quotes });
+    const symbol = String(Array.isArray(req.query?.symbol) ? req.query.symbol[0] : req.query?.symbol || '').trim();
+    const quotes = await fetchFallbackQuotes(symbol || undefined);
+    const count = Object.keys(quotes).length;
+    if (!count) {
+      res.status(symbol ? 404 : 502).json({ error: 'Backup quote providers unavailable' });
+      return;
+    }
+    res.status(200).json({ ok: true, count, source: 'BACKUP (SWISSQUOTE/KRAKEN)', quotes });
     return;
   }
 
