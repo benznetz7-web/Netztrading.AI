@@ -1,11 +1,12 @@
 import React from 'react';
 import { AlertTriangle, RotateCw, Sparkles } from 'lucide-react';
-import type { AiAnalysisResult, LangCode } from '../types/trading';
+import type { AiAnalysisResult, LangCode, MtfSnapshot } from '../types/trading';
 
 interface AiAnalystCardProps {
   lang: LangCode;
   symbol: string;
   tf: string;
+  mtfBreakdown?: MtfSnapshot[];
   result: AiAnalysisResult | null;
   loading: boolean;
   error: string | null;
@@ -18,6 +19,7 @@ export const AiAnalystCard: React.FC<AiAnalystCardProps> = ({
   lang,
   symbol,
   tf,
+  mtfBreakdown,
   result,
   loading,
   error,
@@ -77,6 +79,26 @@ export const AiAnalystCard: React.FC<AiAnalystCardProps> = ({
         </div>
       </div>
 
+      {mtfBreakdown && mtfBreakdown.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-1.5 font-mono text-[10px]">
+          <span className="font-bold text-indigo-300">MTF:</span>
+          {mtfBreakdown.map((m) => {
+            const colorCls =
+              m.bias === 'BULLISH'
+                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                : m.bias === 'BEARISH'
+                ? 'border-red-500/40 bg-red-500/10 text-red-300'
+                : 'border-[#1e2535] bg-[#080a0f] text-slate-400';
+            const dirTxt = m.bias === 'BULLISH' ? 'BULL' : m.bias === 'BEARISH' ? 'BEAR' : 'FLAT';
+            return (
+              <span key={m.tf} className={`rounded-md border px-1.5 py-0.5 font-bold ${colorCls}`}>
+                {m.tf} {dirTxt}
+              </span>
+            );
+          })}
+        </div>
+      )}
+
       {error && (
         <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl border border-red-500/40 bg-red-950/40 px-3 py-2 font-mono text-[11px] text-red-300">
           <span>{error}</span>
@@ -93,8 +115,8 @@ export const AiAnalystCard: React.FC<AiAnalystCardProps> = ({
       {!result && loading && !error && (
         <div className="mt-3 rounded-xl border border-[#1e2535] bg-[#080a0f] p-3 font-mono text-[11px] text-indigo-300">
           {isKh
-            ? `AI កំពុងអានទៀន OHLC, តំបន់ S/R និងសញ្ញាត្រឡប់ខ្លួនសម្រាប់ ${symbol} (${tf})…`
-            : `AI reading live OHLC candles, S/R levels & reversal structure for ${symbol} (${tf})…`}
+            ? `AI កំពុងអានទៀន OHLC, MTF, តំបន់ S/R និង ICT សម្រាប់ ${symbol} (${tf})…`
+            : `AI reading live OHLC, MTF, S/R levels & ICT structure for ${symbol} (${tf})…`}
         </div>
       )}
 

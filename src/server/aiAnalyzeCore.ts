@@ -45,6 +45,24 @@ export interface AiAnalyzeRequestBody {
     l: number;
     c: number;
   }>;
+  mtfContext?: Array<{
+    tf: string;
+    bias: string;
+    regime?: string;
+    structure: string;
+    emaTrend?: string;
+    rsi14?: number | null;
+    r1?: number | null;
+    s1?: number | null;
+    ictNote?: string;
+  }>;
+  ictContext?: {
+    fvg?: string;
+    ob?: string;
+    breaker?: string;
+    htfSummary?: string;
+    sidewayBlocked?: boolean;
+  };
   candleTime?: number;
 }
 
@@ -232,6 +250,127 @@ function normalizeAiPayload(
   };
 }
 
+function getSymbolDigits(symbol: string): number {
+  if (symbol.includes('JPY')) return 3;
+  if (symbol === 'XRPUSD') return 4;
+  if (['EURUSD', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD'].includes(symbol)) return 5;
+  return 2;
+}
+
+function fmtLvl(val: number | null | undefined, digits: number): string {
+  return typeof val === 'number' && Number.isFinite(val) ? val.toFixed(digits) : '—';
+}
+
+function parseLabeledNum(text: string, labelRe: RegExp): number | null {
+  const m = text.match(labelRe);
+  if (!m?.[1]) return null;
+  const n = Number(m[1].replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+export function enforceAiChartConsistency(
+  payload: AiAnalyzeResponsePayload,
+  body: Partial<AiAnalyzeRequestBody>
+): AiAnalyzeResponsePayload {
+  const sym = payload.symbol;
+  const digits = getSymbolDigits(sym);
+  const sig = body.quantSignal;
+  const lvl = body.keyLevels;
+  const q = body.quote;
+  const lang = body.lang === 'kh' ? 'kh' : 'en';
+  const mtf = Array.isArray(body.mtfContext) ? body.mtfContext : [];
+
+  const r1 = typeof lvl?.r1 === 'number' && Number.isFinite(lvl.r1) ? lvl.r1 : null;
+  const s1 = typeof lvl?.s1 === 'number' && Number.isFinite(lvl.s1) ? lvl.s1 : null;
+  const r1Str = fmtLvl(r1, digits);
+  const s1Str = fmtLvl(s1, digits);
+
+  // Build exact MTF summary tag if any higher timeframes are present
+  const mtfTag = mtf.length
+    ? mtf
+        .slice(0, 4)
+        .map((m) => `${m.tf}:${m.bias === 'BULLISH' ? 'BULL' : m.bias === 'BEARISH' ? 'BEAR' : 'FLAT'}`)
+        .join(' · ')
+    : '';
+
+  // Enforce WAIT during hard sideways chop when signal engine flagged sidewayBlocked and no clear HTF breakout
+  let bias = payload.bias;
+  if (body.ictContext?.sidewayBlocked && sig?.state === 'WAIT' && bias !== 'WAIT') {
+    bias = 'WAIT';
+  }
+
+  // Extract SL/TP numbers mentioned by AI in entryPlan to verify direction geometry
+  const aiSl = parseLabeledNum(payload.entryPlan, /\bSL[:\s]*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)/i);
+  const aiTp1 = parseLabeledNum(payload.entryPlan, /\bTP1?[:\s]*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)/i);
+  const refEntry =
+    typeof sig?.entry === 'number' && Number.isFinite(sig.entry)
+      ? sig.entry
+      : typeof q?.mid === 'number' && Number.isFinite(q.mid)
+      ? q.mid
+      : null;
+
+  const entryPlanMatchesOppositeWord =
+    (bias === 'BUY' && /\bSELL\b/i.test(payload.entryPlan) && !/\bBUY\b/i.test(payload.entryPlan)) ||
+    (bias === 'SELL' && /\bBUY\b/i.test(payload.entryPlan) && !/\bSELL\b/i.test(payload.entryPlan));
+
+  const buyGeometryBroken =
+    bias === 'BUY' &&
+    refEntry !== null &&
+    ((aiSl !== null && aiSl >= refEntry) || (aiTp1 !== null && aiTp1 <= refEntry));
+  const sellGeometryBroken =
+    bias === 'SELL' &&
+    refEntry !== null &&
+    ((aiSl !== null && aiSl <= refEntry) || (aiTp1 !== null && aiTp1 >= refEntry));
+
+  let entryPlan = payload.entryPlan;
+  if (
+    sig?.state === 'READY' &&
+    (sig.type === 'BUY' || sig.type === 'SELL') &&
+    sig.entry !== null &&
+    sig.sl !== null &&
+    sig.tp1 !== null
+  ) {
+    if (bias === sig.type && (entryPlanMatchesOppositeWord || buyGeometryBroken || sellGeometryBroken)) {
+      entryPlan = `${sig.type} ${fmtLvl(sig.entry, digits)}, SL ${fmtLvl(sig.sl, digits)}, TP1 ${fmtLvl(sig.tp1, digits)}, TP2 ${fmtLvl(sig.tp2, digits)}`;
+    } else if (bias !== sig.type && (buyGeometryBroken || sellGeometryBroken || entryPlanMatchesOppositeWord)) {
+      // LLM took opposite bias word while copying quantSignal's opposite SL/TP numbers -> safely move to WAIT conditional plan
+      bias = 'WAIT';
+    }
+  } else if (buyGeometryBroken || sellGeometryBroken || entryPlanMatchesOppositeWord) {
+    bias = 'WAIT';
+  }
+
+  if (bias === 'WAIT') {
+    const looksLikeDirectOrder =
+      /\b(Buy|Sell)\s+(now|near|at)\b/i.test(entryPlan) || buyGeometryBroken || sellGeometryBroken;
+    if (looksLikeDirectOrder || !entryPlan || entryPlan === '—') {
+      entryPlan =
+        lang === 'kh'
+          ? `រង់ចាំបំបែក > R1 (${r1Str}) ទើប BUY ឬធ្លាក់ < S1 (${s1Str}) ទើប SELL`
+          : `Wait break > R1 (${r1Str}) for BUY or < S1 (${s1Str}) for SELL`;
+    }
+  }
+
+  // Ensure srVerdict never drops or hallucinates R1/S1 away from real chart levels
+  let srVerdict = payload.srVerdict;
+  if (r1 !== null && s1 !== null) {
+    const mentionsR1 = srVerdict.includes(r1Str.slice(0, Math.max(4, r1Str.length - 1)));
+    const mentionsS1 = srVerdict.includes(s1Str.slice(0, Math.max(4, s1Str.length - 1)));
+    if (!mentionsR1 || !mentionsS1) {
+      srVerdict = mtfTag ? `R1 ${r1Str} · S1 ${s1Str} | ${mtfTag}` : `R1 ${r1Str} · S1 ${s1Str}`;
+    } else if (mtfTag && !srVerdict.includes(':')) {
+      srVerdict = `${srVerdict} | ${mtfTag}`;
+    }
+  }
+
+  return {
+    ...payload,
+    bias,
+    srVerdict,
+    entryPlan,
+  };
+}
+
 async function analyzeWithOpenAiCompatibleEndpoint(opts: {
   url: string;
   headers?: Record<string, string>;
@@ -307,7 +446,8 @@ export async function analyzeMarketWithGemini(
     Number(c.c),
   ]);
   const latestCandleTag = candles[candles.length - 1]?.[0] || '';
-  const cacheKey = `${symbol}:${tf}:${lang}:${latestCandleTag}:${body.quantSignal?.state || ''}`;
+  const sigTag = `${body.quantSignal?.state || ''}:${body.quantSignal?.type || ''}:${body.quantSignal?.entry ?? ''}:${body.quantSignal?.sl ?? ''}`;
+  const cacheKey = `${symbol}:${tf}:${lang}:${latestCandleTag}:${sigTag}`;
   const cached = serverAiCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return { ok: true, status: 200, data: cached.payload };
@@ -315,8 +455,15 @@ export async function analyzeMarketWithGemini(
 
   const langInstruction =
     lang === 'kh'
-      ? 'Write srVerdict, reversalAlert, entryPlan, riskNote, summary in concise Khmer (ភាសាខ្មែរ) under 18 words each using ONLY exact numbers from Snapshot.'
-      : 'Write srVerdict, reversalAlert, entryPlan, riskNote, summary in crisp English under 18 words each using ONLY exact numbers from Snapshot.';
+      ? 'Write srVerdict, reversalAlert, entryPlan, riskNote, summary in concise Khmer (ភាសាខ្មែរ) under 20 words each using ONLY exact numbers from Snapshot.'
+      : 'Write srVerdict, reversalAlert, entryPlan, riskNote, summary in crisp English under 20 words each using ONLY exact numbers from Snapshot.';
+
+  const coreAnalystRules =
+    `Institutional Forex/Gold/Crypto Top-Down Multi-Timeframe (MTF) + S/R + ICT analyst. ` +
+    `1) Use mtfContext FIRST (for M1 check M5/M15; for M5 check M15/H1; for M15 check H1/H4/D1/W1) to judge macro trend & future price path. ` +
+    `2) Check ictContext (FVG/OB/Breaker/Sweep) & ohlc14 vs EXACT lvl (R1/R2/S1/S2/PDH/PDL) — NEVER mistake q.mid for R1 or S1. ` +
+    `3) If market is Sideways/Chop (sidewayBlocked=true or sig.state="WAIT"), prefer bias="WAIT" and give conditional break > R1 / bounce S1 plan. ` +
+    `4) STRICT GEOMETRY: If bias="BUY", SL MUST be < Entry and TP1/TP2 > Entry. If bias="SELL", SL MUST be > Entry and TP1/TP2 < Entry. Never mix BUY with SELL numbers. ${langInstruction}`;
 
   const promptPayload = {
     s: symbol,
@@ -324,6 +471,8 @@ export async function analyzeMarketWithGemini(
     q: body.quote,
     lvl: body.keyLevels,
     sig: body.quantSignal,
+    mtf: body.mtfContext || [],
+    ict: body.ictContext || null,
     ohlc14: candles,
   };
   const snapshotMessage = `Snapshot ${symbol} ${tf}:\n${JSON.stringify(promptPayload)}`;
@@ -355,9 +504,7 @@ export async function analyzeMarketWithGemini(
       try {
         const config: Record<string, unknown> = {
           abortSignal: AbortSignal.timeout(10500),
-          systemInstruction:
-            `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 ([HH:MM,O,H,L,C]) vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
-            `Highlight S/R rejections/bounces (reversals at R1/R2 or S1/S2) vs breakouts. Never invent prices. ${langInstruction}`,
+          systemInstruction: coreAnalystRules,
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -365,11 +512,11 @@ export async function analyzeMarketWithGemini(
               bias: { type: Type.STRING, description: 'BUY, SELL, or WAIT.' },
               confidence: { type: Type.INTEGER, description: '0 to 100.' },
               setupType: { type: Type.STRING, description: '2-4 word setup name.' },
-              srVerdict: { type: Type.STRING, description: 'Price vs S1/R1/PDH/PDL.' },
+              srVerdict: { type: Type.STRING, description: 'Exact R1/S1 + MTF bias.' },
               reversalAlert: { type: Type.STRING, description: 'Reversal at R1/R2/S1/S2 or None.' },
-              entryPlan: { type: Type.STRING, description: 'Exact entry zone, TP1, SL.' },
+              entryPlan: { type: Type.STRING, description: 'Exact directional entry, SL, TP1.' },
               riskNote: { type: Type.STRING, description: 'Invalidation price.' },
-              summary: { type: Type.STRING, description: 'One-sentence verdict.' },
+              summary: { type: Type.STRING, description: 'Top-down MTF + future outlook.' },
             },
             required: ['bias', 'confidence', 'setupType', 'srVerdict', 'reversalAlert', 'entryPlan', 'riskNote', 'summary'],
           },
@@ -386,7 +533,7 @@ export async function analyzeMarketWithGemini(
         });
 
         const parsed = extractJsonObject(response.text ?? '{}');
-        const payload = normalizeAiPayload(symbol, tf, parsed, modelName);
+        const payload = enforceAiChartConsistency(normalizeAiPayload(symbol, tf, parsed, modelName), body);
 
         serverAiCache.set(cacheKey, { payload, expiresAt: Date.now() + 120000 });
         if (serverAiCache.size > 60) {
@@ -429,8 +576,7 @@ export async function analyzeMarketWithGemini(
           {
             role: 'system',
             content:
-              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 ([HH:MM,O,H,L,C]) vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
-              `Highlight S/R rejections/bounces vs breakouts. Never invent prices. ${langInstruction} ` +
+              `${coreAnalystRules} ` +
               `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary.`,
           },
           { role: 'user', content: snapshotMessage },
@@ -438,8 +584,9 @@ export async function analyzeMarketWithGemini(
       },
     });
     if (groqRes.ok) {
-      serverAiCache.set(cacheKey, { payload: groqRes.data, expiresAt: Date.now() + 120000 });
-      return { ok: true, status: 200, data: groqRes.data };
+      const cleanData = enforceAiChartConsistency(groqRes.data, body);
+      serverAiCache.set(cacheKey, { payload: cleanData, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: cleanData };
     }
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     attemptNotes.push(`groq:${groqRes.status}(${elapsed}s)`);
@@ -467,8 +614,7 @@ export async function analyzeMarketWithGemini(
           {
             role: 'system',
             content:
-              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
-              `Never invent prices. ${langInstruction} ` +
+              `${coreAnalystRules} ` +
               `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary.`,
           },
           { role: 'user', content: snapshotMessage },
@@ -476,8 +622,9 @@ export async function analyzeMarketWithGemini(
       },
     });
     if (orRes.ok) {
-      serverAiCache.set(cacheKey, { payload: orRes.data, expiresAt: Date.now() + 120000 });
-      return { ok: true, status: 200, data: orRes.data };
+      const cleanData = enforceAiChartConsistency(orRes.data, body);
+      serverAiCache.set(cacheKey, { payload: cleanData, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: cleanData };
     }
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     attemptNotes.push(`openrouter:${orRes.status}(${elapsed}s)`);
@@ -501,8 +648,7 @@ export async function analyzeMarketWithGemini(
           {
             role: 'system',
             content:
-              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Evaluate ohlc14 vs R1/R2/S1/S2/PDH/PDL, EMA8/21, MACD, RSI14, ATR14. ` +
-              `Never invent prices. ${langInstruction} ` +
+              `${coreAnalystRules} ` +
               `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary.`,
           },
           { role: 'user', content: snapshotMessage },
@@ -510,8 +656,9 @@ export async function analyzeMarketWithGemini(
       },
     });
     if (ovhRes.ok) {
-      serverAiCache.set(cacheKey, { payload: ovhRes.data, expiresAt: Date.now() + 120000 });
-      return { ok: true, status: 200, data: ovhRes.data };
+      const cleanData = enforceAiChartConsistency(ovhRes.data, body);
+      serverAiCache.set(cacheKey, { payload: cleanData, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: cleanData };
     }
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     attemptNotes.push(`ovh:${ovhRes.status}(${elapsed}s)`);
@@ -535,7 +682,9 @@ export async function analyzeMarketWithGemini(
           {
             role: 'system',
             content:
-              `Institutional Forex/Gold/Crypto S/R & price-action analyst. Strictly use ONLY exact numbers from Snapshot (never invent prices or lots). ` +
+              `Institutional Top-Down Multi-Timeframe (MTF) + S/R + ICT analyst. Use mtfContext & ictContext & exact lvl (R1/R2/S1/S2/PDH/PDL). ` +
+              `Never confuse q.mid for R1/S1. If sidewayBlocked=true or sig.state="WAIT", prefer bias="WAIT". ` +
+              `STRICT GEOMETRY: BUY must have SL < Entry < TP1; SELL must have SL > Entry > TP1. ` +
               `Return ONLY a valid JSON object with keys: bias ("BUY"|"SELL"|"WAIT"), confidence (integer 0..100), setupType, srVerdict, reversalAlert, entryPlan, riskNote, summary. Write crisp English under 18 words per field.`,
           },
           { role: 'user', content: snapshotMessage },
@@ -543,8 +692,9 @@ export async function analyzeMarketWithGemini(
       },
     });
     if (pollRes.ok) {
-      serverAiCache.set(cacheKey, { payload: pollRes.data, expiresAt: Date.now() + 120000 });
-      return { ok: true, status: 200, data: pollRes.data };
+      const cleanData = enforceAiChartConsistency(pollRes.data, body);
+      serverAiCache.set(cacheKey, { payload: cleanData, expiresAt: Date.now() + 120000 });
+      return { ok: true, status: 200, data: cleanData };
     }
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     attemptNotes.push(`pollinations:${pollRes.status}(${elapsed}s)`);

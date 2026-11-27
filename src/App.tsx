@@ -250,7 +250,7 @@ export default function App() {
   const aiDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAiDispatchRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
   const lastAutoAiGlobalAtRef = useRef<number>(0);
-  const aiCacheRef = useRef<Record<string, { result: AiAnalysisResult; candleTime: number; fetchedAt: number }>>({});
+  const aiCacheRef = useRef<Record<string, { result: AiAnalysisResult; sigSignature: string; candleTime: number; fetchedAt: number }>>({});
 
   const signalRConnRef = useRef<signalR.HubConnection | null>(null);
   const signalRStateRef = useRef<string>('DISCONNECTED');
@@ -390,7 +390,8 @@ export default function App() {
       h1Bars: CandleBar[] | null,
       isBarCloseOrLoad: boolean,
       latencyMs: number,
-      scheduleBacktest: boolean
+      scheduleBacktest: boolean,
+      mtfBars?: Partial<Record<TimeframeKey, CandleBar[] | null>>
     ) => {
       const prov = stateRef.current.provider;
       const rCfg = stateRef.current.riskConfig;
@@ -404,18 +405,54 @@ export default function App() {
         brokerSpecsOverride: brokerSpecsOverrideRef.current,
         liveQuote,
         freshness,
+        mtfBars,
       });
 
       const lockKey = `${prov}:${sym}:${tf}`;
       let activeLock: ActiveLock | undefined = activeLocksRef.current[lockKey];
 
-      if (activeLock && isBarCloseOrLoad && fresh.candleTime > activeLock.candleTime) {
-        const opp =
-          (activeLock.type === 'BUY' && (fresh.type === 'SELL' || fresh.diagSetup.startsWith('SELL'))) ||
-          (activeLock.type === 'SELL' && (fresh.type === 'BUY' || fresh.diagSetup.startsWith('BUY')));
-        if (opp && fresh.setupScore >= 60) {
+      if (activeLock && !activeLock.tp1Hit && fresh.candleTime > activeLock.candleTime) {
+        const oppSignal =
+          (fresh.state === 'READY' && fresh.type !== activeLock.type) ||
+          (((activeLock.type === 'BUY' && (fresh.type === 'SELL' || fresh.diagSetup.startsWith('SELL'))) ||
+            (activeLock.type === 'SELL' && (fresh.type === 'BUY' || fresh.diagSetup.startsWith('BUY')))) &&
+            fresh.setupScore >= 58);
+
+        const structOpposite =
+          (activeLock.type === 'BUY' && fresh.structure.type === 'BEARISH') ||
+          (activeLock.type === 'SELL' && fresh.structure.type === 'BULLISH');
+
+        const primaryHtfBias = fresh.mtfBreakdown?.[0]?.bias;
+        const momentumAndHtfFlipped =
+          (activeLock.type === 'BUY' &&
+            fresh.ema8 !== null &&
+            fresh.ema21 !== null &&
+            fresh.ema8 < fresh.ema21 &&
+            (fresh.macdHist ?? 0) < 0 &&
+            primaryHtfBias === 'BEARISH') ||
+          (activeLock.type === 'SELL' &&
+            fresh.ema8 !== null &&
+            fresh.ema21 !== null &&
+            fresh.ema8 > fresh.ema21 &&
+            (fresh.macdHist ?? 0) > 0 &&
+            primaryHtfBias === 'BULLISH');
+
+        const barsElapsed = Math.floor((fresh.candleTime - activeLock.candleTime) / Math.max(60000, prof.seconds * 1000));
+        const chopStalled = Boolean(fresh.sidewayBlocked && barsElapsed >= 2);
+        const expiredPreTp1 = barsElapsed >= 16;
+
+        if (oppSignal && isBarCloseOrLoad) {
           closeActiveLock(lockKey, 'OPPOSITE SIGNAL', false);
           activeLock = undefined;
+          showToast(`${sym} ${prof.label}: Lock dropped (Opposite signal)`);
+        } else if (structOpposite || momentumAndHtfFlipped) {
+          closeActiveLock(lockKey, 'STRUCTURE INVALIDATED', false);
+          activeLock = undefined;
+          showToast(`${sym} ${prof.label}: Lock dropped (Structure flipped)`);
+        } else if (chopStalled || expiredPreTp1) {
+          closeActiveLock(lockKey, chopStalled ? 'SIDEWAY CHOP DROP' : 'SETUP EXPIRED', false);
+          activeLock = undefined;
+          showToast(`${sym} ${prof.label}: Lock cleared (${chopStalled ? 'Sideway chop' : 'Expired'})`);
         }
       }
 
@@ -564,8 +601,9 @@ export default function App() {
 
     if (!quote || !bundle || bundle.closedBars.length < 10) return;
 
+    const sigSig = `${sig.candleTime}:${sig.state}:${sig.type}:${fmtPrice(sig.entry, sym)}:${fmtPrice(sig.sl, sym)}`;
     const cacheKey = `${sym}:${tf}:${lng}`;
-    const dispatchKey = `${cacheKey}:${sig.candleTime}`;
+    const dispatchKey = `${cacheKey}:${sigSig}`;
     const cached = aiCacheRef.current[cacheKey];
     const now = Date.now();
 
@@ -573,7 +611,7 @@ export default function App() {
       if (now < aiQuotaBackoffUntilRef.current) {
         return;
       }
-      if (cached && cached.candleTime === sig.candleTime && now - cached.fetchedAt < 180000) {
+      if (cached && cached.sigSignature === sigSig && now - cached.fetchedAt < 180000) {
         setAiAnalysis(cached.result);
         setAiError(null);
         return;
@@ -612,6 +650,7 @@ export default function App() {
       symbol: sym,
       tf,
       lang: lng,
+      candleTime: sig.candleTime,
       quote: {
         bid: quote.bid,
         ask: quote.ask,
@@ -645,6 +684,14 @@ export default function App() {
         s2: sig.keyLevels.s2?.price ?? null,
         pdh: sig.keyLevels.pdh ?? null,
         pdl: sig.keyLevels.pdl ?? null,
+      },
+      mtfContext: sig.mtfBreakdown || [],
+      ictContext: {
+        fvg: sig.fvg.label,
+        ob: sig.ob.label,
+        breaker: sig.breaker.label,
+        htfSummary: sig.htfSummary,
+        sidewayBlocked: Boolean(sig.sidewayBlocked),
       },
       recentCandles: bundle.closedBars.slice(-14).map((b) => ({
         t: b.openTime || new Date(b.timeMs).toISOString(),
@@ -728,7 +775,7 @@ export default function App() {
         aiQuotaBackoffUntilRef.current = 0;
         aiAutoRetriedKeyRef.current = '';
         const result = data as AiAnalysisResult;
-        aiCacheRef.current[cacheKey] = { result, candleTime: sig.candleTime, fetchedAt: Date.now() };
+        aiCacheRef.current[cacheKey] = { result, sigSignature: sigSig, candleTime: sig.candleTime, fetchedAt: Date.now() };
         setAiAnalysis(result);
       }
     } catch (err: any) {
@@ -753,10 +800,11 @@ export default function App() {
       const sym = sig.asset || stateRef.current.activeSymbol;
       const tf = sig.tf || stateRef.current.currentTF;
       const lng = stateRef.current.lang;
+      const sigSig = `${sig.candleTime}:${sig.state}:${sig.type}:${fmtPrice(sig.entry, sym)}:${fmtPrice(sig.sl, sym)}`;
       const cacheKey = `${sym}:${tf}:${lng}`;
-      const dispatchKey = `${cacheKey}:${sig.candleTime}`;
+      const dispatchKey = `${cacheKey}:${sigSig}`;
       const cached = aiCacheRef.current[cacheKey];
-      if (cached && cached.candleTime === sig.candleTime && Date.now() - cached.fetchedAt < 180000) {
+      if (cached && cached.sigSignature === sigSig && Date.now() - cached.fetchedAt < 180000) {
         setAiAnalysis(cached.result);
         setAiError(null);
         return;
@@ -786,42 +834,58 @@ export default function App() {
       const prof = TF_PROFILES[tf];
       const cacheKey = `${prov}:${sym}:${tf}`;
       const existingBundle = candlesCacheRef.current[cacheKey];
+      const extraTfs = Array.from(new Set<TimeframeKey>([...(prof.mtfChain || []), prof.htf, 'D1', 'H1'])).filter(
+        (t) => t !== tf
+      );
+
+      const readCachedMtf = (selfBars: CandleBar[]): Partial<Record<TimeframeKey, CandleBar[] | null>> => {
+        const map: Partial<Record<TimeframeKey, CandleBar[] | null>> = { [tf]: selfBars };
+        extraTfs.forEach((t) => {
+          map[t] = candlesCacheRef.current[`${prov}:${sym}:${t}`]?.closedBars || null;
+        });
+        return map;
+      };
 
       // Render cached bundle immediately so chart/signals never flicker or blank out
       if (existingBundle && existingBundle.closedBars.length >= 30) {
-        const cHtf = candlesCacheRef.current[`${prov}:${sym}:${prof.htf}`];
-        const cD1 = candlesCacheRef.current[`${prov}:${sym}:D1`];
-        const cH1 = candlesCacheRef.current[`${prov}:${sym}:H1`];
+        const cachedMtf = readCachedMtf(existingBundle.closedBars);
         applyEvaluationToUI(
           sym,
           tf,
           existingBundle,
-          cHtf?.closedBars || null,
-          cD1?.closedBars || null,
-          cH1?.closedBars || null,
+          cachedMtf[prof.htf] || null,
+          cachedMtf.D1 || null,
+          cachedMtf.H1 || null,
           isBarCloseOrLoad,
           performance.now() - t0,
-          false
+          false,
+          cachedMtf
         );
       }
 
       try {
-        const [ltfR, htfR, d1R, h1R] = await Promise.allSettled([
+        const [ltfR, ...extraResults] = await Promise.allSettled([
           fetchSymbolCandles(prov, sym, tf, candlesCacheRef.current, !forceFreshLtf && !isBarCloseOrLoad),
-          prof.htf !== tf
-            ? fetchSymbolCandles(prov, sym, prof.htf, candlesCacheRef.current, true)
-            : Promise.resolve(null),
-          tf !== 'D1' ? fetchSymbolCandles(prov, sym, 'D1', candlesCacheRef.current, true) : Promise.resolve(null),
-          tf !== 'H1' ? fetchSymbolCandles(prov, sym, 'H1', candlesCacheRef.current, true) : Promise.resolve(null),
+          ...extraTfs.map((t) => fetchSymbolCandles(prov, sym, t, candlesCacheRef.current, true)),
         ]);
 
         if (myEp !== analysisEpochRef.current) return 0;
         if (ltfR.status !== 'fulfilled') throw ltfR.reason;
 
         const ltf = ltfR.value;
-        const htfBars = prof.htf === tf ? ltf.closedBars : htfR.status === 'fulfilled' ? htfR.value?.closedBars || null : null;
-        const d1Bars = tf === 'D1' ? ltf.closedBars : d1R.status === 'fulfilled' ? d1R.value?.closedBars || null : null;
-        const h1Bars = tf === 'H1' ? ltf.closedBars : h1R.status === 'fulfilled' ? h1R.value?.closedBars || null : null;
+        const mtfBars: Partial<Record<TimeframeKey, CandleBar[] | null>> = { [tf]: ltf.closedBars };
+        extraTfs.forEach((t, idx) => {
+          const r = extraResults[idx];
+          if (r && r.status === 'fulfilled' && r.value?.closedBars?.length) {
+            mtfBars[t] = r.value.closedBars;
+          } else {
+            mtfBars[t] = candlesCacheRef.current[`${prov}:${sym}:${t}`]?.closedBars || null;
+          }
+        });
+
+        const htfBars = prof.htf === tf ? ltf.closedBars : mtfBars[prof.htf] || null;
+        const d1Bars = tf === 'D1' ? ltf.closedBars : mtfBars.D1 || null;
+        const h1Bars = tf === 'H1' ? ltf.closedBars : mtfBars.H1 || null;
 
         const evaluated = applyEvaluationToUI(
           sym,
@@ -832,7 +896,8 @@ export default function App() {
           h1Bars,
           isBarCloseOrLoad,
           performance.now() - t0,
-          true
+          true,
+          mtfBars
         );
         scheduleAutoAi(evaluated);
         return ltf.closedBars.length ? ltf.closedBars[ltf.closedBars.length - 1].timeMs : 0;
@@ -841,19 +906,18 @@ export default function App() {
         const fallbackBundle = candlesCacheRef.current[cacheKey];
         if (fallbackBundle && fallbackBundle.closedBars.length >= 30) {
           // Keep live chart & quant analysis alive on cached candles when mobile Safari/network aborts a refresh
-          const cHtf = candlesCacheRef.current[`${prov}:${sym}:${prof.htf}`];
-          const cD1 = candlesCacheRef.current[`${prov}:${sym}:D1`];
-          const cH1 = candlesCacheRef.current[`${prov}:${sym}:H1`];
+          const cachedMtf = readCachedMtf(fallbackBundle.closedBars);
           applyEvaluationToUI(
             sym,
             tf,
             fallbackBundle,
-            cHtf?.closedBars || null,
-            cD1?.closedBars || null,
-            cH1?.closedBars || null,
+            cachedMtf[prof.htf] || null,
+            cachedMtf.D1 || null,
+            cachedMtf.H1 || null,
             false,
             performance.now() - t0,
-            false
+            false,
+            cachedMtf
           );
           return fallbackBundle.closedBars[fallbackBundle.closedBars.length - 1].timeMs;
         }
@@ -2523,6 +2587,27 @@ export default function App() {
                 ))}
               </div>
 
+              {/* MTF Top-Down Hierarchy Strip */}
+              {currentSignal.mtfBreakdown && currentSignal.mtfBreakdown.length > 0 && (
+                <div className="mt-2.5 flex flex-wrap items-center gap-1.5 rounded-xl border border-[#1e2535] bg-[#080a0f] px-3 py-2 font-mono text-[10px]">
+                  <span className="font-bold text-indigo-300">MTF BIAS:</span>
+                  {currentSignal.mtfBreakdown.map((m) => {
+                    const cls =
+                      m.bias === 'BULLISH'
+                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                        : m.bias === 'BEARISH'
+                        ? 'border-red-500/40 bg-red-500/10 text-red-300'
+                        : 'border-[#1e2535] bg-[#121620] text-slate-400';
+                    const dir = m.bias === 'BULLISH' ? 'BULL' : m.bias === 'BEARISH' ? 'BEAR' : 'FLAT';
+                    return (
+                      <span key={m.tf} className={`rounded-md border px-2 py-0.5 font-bold ${cls}`}>
+                        {m.tf}: {dir} · {m.structure}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
               {/* Context Footer */}
               <div className="mt-2.5 grid grid-cols-1 gap-2 border-t border-[#1e2535] pt-2.5 text-[11px] md:grid-cols-3">
                 <div className="rounded-xl border border-amber-500/30 bg-[#080a0f] p-2.5">
@@ -2550,6 +2635,7 @@ export default function App() {
               lang={lang}
               symbol={activeSymbol}
               tf={currentTF}
+              mtfBreakdown={currentSignal.mtfBreakdown}
               result={aiAnalysis}
               loading={aiLoading}
               error={aiError}

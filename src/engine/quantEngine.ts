@@ -9,6 +9,7 @@ import type {
   KeyLevelPoint,
   KeyLevels,
   MarketStructure,
+  MtfSnapshot,
   ProviderType,
   QuoteData,
   RegimeInfo,
@@ -272,7 +273,8 @@ export function extractKeyLevels(
   h1Bars: CandleBar[] | null,
   atr: number,
   sym: string,
-  refPrice: number
+  refPrice: number,
+  h4Bars: CandleBar[] | null = null
 ): KeyLevels {
   const spec = SYMBOL_SPECS[sym] || { roundStep: 10 };
   const bars = closedBars.slice(-140);
@@ -319,11 +321,16 @@ export function extractKeyLevels(
     add(pdl, pdl <= refPrice ? 'S' : 'R', 'PDL', 5);
   }
 
-  // 3. H1 Major Fractal Swings
+  // 3. H1 & H4 Major Fractal Swings
   if (h1Bars && h1Bars.length >= 20) {
     const hSw = detectConfirmedSwings(h1Bars.slice(-80), atr);
     hSw.swingHighs.slice(-6).forEach((s) => add(s.price, s.price > refPrice ? 'R' : 'S', 'H1', 4));
     hSw.swingLows.slice(-6).forEach((s) => add(s.price, s.price < refPrice ? 'S' : 'R', 'H1', 4));
+  }
+  if (h4Bars && h4Bars.length >= 16) {
+    const h4Sw = detectConfirmedSwings(h4Bars.slice(-60), atr);
+    h4Sw.swingHighs.slice(-4).forEach((s) => add(s.price, s.price > refPrice ? 'R' : 'S', 'H4', 4.5));
+    h4Sw.swingLows.slice(-4).forEach((s) => add(s.price, s.price < refPrice ? 'S' : 'R', 'H4', 4.5));
   }
 
   // Cluster WITHOUT diluting exact structural anchor price by round numbers
@@ -390,10 +397,16 @@ export function extractKeyLevels(
   }
 
   const above = clusters
-    .filter((c) => c.price > refPrice + minGap * 0.20)
+    .filter((c) => {
+      const isStructural = c.touches >= 2 || !c.tags.has('Round');
+      return c.price > refPrice + (isStructural ? atr * 0.05 : minGap * 0.20);
+    })
     .sort((a, b) => a.price - b.price);
   const below = clusters
-    .filter((c) => c.price < refPrice - minGap * 0.20)
+    .filter((c) => {
+      const isStructural = c.touches >= 2 || !c.tags.has('Round');
+      return c.price < refPrice - (isStructural ? atr * 0.05 : minGap * 0.20);
+    })
     .sort((a, b) => b.price - a.price);
 
   const r1 = above[0] || null;
@@ -684,11 +697,12 @@ export function detectFastAndKeyTriggers(
   const srBreakoutBull = Boolean(r1 && prev.close <= r1 && last.close > r1 && bullClose);
   const srBreakoutBear = Boolean(s1 && prev.close >= s1 && last.close < s1 && bearClose);
 
-  // Fast Strategy 1: Trend Momentum (EMA 8/21 alignment with bullish/bearish bar OR MACD momentum)
-  const macdBull = macd.hist > 0 || (macd.hist > macd.prevHist && bullClose);
-  const macdBear = macd.hist < 0 || (macd.hist < macd.prevHist && bearClose);
-  const fastMomentumBull = e8 > e21 && (bullClose || macdBull) && last.close > e21;
-  const fastMomentumBear = e8 < e21 && (bearClose || macdBear) && last.close < e21;
+  // Fast Strategy 1: Confirmed Trend Momentum (requires true EMA separation & directional expansion — never bare candle above entry in chop)
+  const emaGap = Math.abs(e8 - e21);
+  const macdBull = macd.hist > 0 && macd.hist >= macd.prevHist * 0.85;
+  const macdBear = macd.hist < 0 && macd.hist <= macd.prevHist * 0.85;
+  const fastMomentumBull = e8 > e21 && emaGap >= atr * 0.16 && bullClose && macdBull && last.close > e8;
+  const fastMomentumBear = e8 < e21 && emaGap >= atr * 0.16 && bearClose && macdBear && last.close < e8;
 
   // Fast Strategy 2: Squeeze Breakout
   const squeezeBreakBull = sq.squeezePopUp && e8 >= e21 && bullClose;
@@ -699,8 +713,8 @@ export function detectFastAndKeyTriggers(
   const bearBreakRetest = Boolean(keyLevels.all.some((k) => prev.close < k.price && last.high >= k.price - zoneTol && last.close < k.price && bearClose));
 
   // Strategy 4: Structure / Price Action Impulse
-  const paBull = (bullEngulf || bullPin || (st.type === 'BULLISH' && bullClose));
-  const paBear = (bearEngulf || bearPin || (st.type === 'BEARISH' && bearClose));
+  const paBull = bullEngulf || bullPin || (st.type === 'BULLISH' && bullClose && last.close > e21);
+  const paBear = bearEngulf || bearPin || (st.type === 'BEARISH' && bearClose && last.close < e21);
 
   return {
     bullClose,
@@ -724,21 +738,104 @@ export function detectFastAndKeyTriggers(
 }
 
 export function evaluateHTFContext(bars: CandleBar[] | null, lbl: string, sym: string) {
-  if (!bars || bars.length < 25) return { bias: 'NEUTRAL', wB: 5, wS: 5, label: `${lbl}: Neutral` };
+  if (!bars || bars.length < 25) return { bias: 'NEUTRAL' as const, wB: 5, wS: 5, label: `${lbl}: Neutral`, snapshot: null as MtfSnapshot | null };
   const cl = bars.map((x) => x.close);
   const e8 = calculateEMASeries(cl, 8).pop()!;
   const e21 = calculateEMASeries(cl, 21).pop()!;
   const atrS = calculateATRSeries(bars, 14);
-  const atr = atrS.length ? atrS[atrS.length - 1] : 0;
+  const atr = atrS.length ? atrS[atrS.length - 1] : cl[cl.length - 1] * 0.002;
+  const adx = calculateADX(bars, 14) ?? 18;
+  const rsi14 = calculateRSI(cl, 14);
   const st = analyzeMarketStructure(bars, atr, sym, 14);
+  const fvg = analyzeFVGs(bars, atr, sym);
+  const kl = extractKeyLevels(bars, null, null, atr, sym, cl[cl.length - 1]);
+  const emaGapAtr = atr > 0 ? Math.abs(e8 - e21) / atr : 0;
+  const emaTrend: 'BULL' | 'BEAR' | 'FLAT' = emaGapAtr < 0.14 ? 'FLAT' : e8 > e21 ? 'BULL' : 'BEAR';
+
   let bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
-  if (e8 > e21 || st.type === 'BULLISH') bias = 'BULLISH';
-  else if (e8 < e21 || st.type === 'BEARISH') bias = 'BEARISH';
+  if (st.type === 'BULLISH' && e8 >= e21) bias = 'BULLISH';
+  else if (st.type === 'BEARISH' && e8 <= e21) bias = 'BEARISH';
+  else if (st.type === 'BULLISH' || (emaTrend === 'BULL' && adx >= 18 && st.type !== 'BEARISH')) bias = 'BULLISH';
+  else if (st.type === 'BEARISH' || (emaTrend === 'BEAR' && adx >= 18)) bias = 'BEARISH';
+
+  const snapshot: MtfSnapshot = {
+    tf: lbl as TimeframeKey,
+    bias,
+    regime: adx < 18 ? 'RANGE' : 'TREND',
+    structure: st.label,
+    emaTrend,
+    rsi14: rsi14 !== null ? Number(rsi14.toFixed(1)) : null,
+    r1: kl.r1?.price ?? null,
+    s1: kl.s1?.price ?? null,
+    ictNote: fvg.label,
+  };
+
   return {
     bias,
     wB: bias === 'BULLISH' ? 15 : bias === 'NEUTRAL' ? 5 : 0,
     wS: bias === 'BEARISH' ? 15 : bias === 'NEUTRAL' ? 5 : 0,
     label: `${lbl}: ${bias}`,
+    snapshot,
+  };
+}
+
+export function evaluateMultiTimeframeContext(
+  activeTf: TimeframeKey,
+  mtfMap: Partial<Record<TimeframeKey, CandleBar[] | null>> | undefined,
+  htfBars: CandleBar[] | null,
+  h1Bars: CandleBar[] | null,
+  d1Bars: CandleBar[] | null,
+  sym: string
+) {
+  const prof = TF_PROFILES[activeTf] || TF_PROFILES.M15;
+  const chain = prof.mtfChain || (prof.htf !== activeTf ? [prof.htf] : []);
+  const snapshots: MtfSnapshot[] = [];
+  let bullWeight = 0;
+  let bearWeight = 0;
+  let totalWeight = 0;
+  let primaryBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+
+  chain.forEach((tfKey, idx) => {
+    const bars =
+      mtfMap?.[tfKey] ??
+      (tfKey === prof.htf ? htfBars : tfKey === 'H1' ? h1Bars : tfKey === 'D1' ? d1Bars : null);
+    if (!bars || bars.length < 25) return;
+    const res = evaluateHTFContext(bars, tfKey, sym);
+    if (res.snapshot) snapshots.push(res.snapshot);
+    const weight = idx === 0 ? 10 : idx === 1 ? 7 : 5;
+    totalWeight += weight;
+    if (res.bias === 'BULLISH') bullWeight += weight;
+    else if (res.bias === 'BEARISH') bearWeight += weight;
+    if (tfKey === prof.htf || idx === 0) primaryBias = res.bias;
+  });
+
+  if (snapshots.length === 0 && htfBars && htfBars.length >= 25 && prof.htf !== activeTf) {
+    const fallback = evaluateHTFContext(htfBars, prof.htf, sym);
+    if (fallback.snapshot) snapshots.push(fallback.snapshot);
+    primaryBias = fallback.bias;
+    totalWeight = 10;
+    if (fallback.bias === 'BULLISH') bullWeight = 10;
+    else if (fallback.bias === 'BEARISH') bearWeight = 10;
+  }
+
+  const bullRatio = totalWeight > 0 ? bullWeight / totalWeight : 0;
+  const bearRatio = totalWeight > 0 ? bearWeight / totalWeight : 0;
+  const macroBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' =
+    bullRatio >= 0.55 ? 'BULLISH' : bearRatio >= 0.55 ? 'BEARISH' : primaryBias;
+
+  const wB = totalWeight > 0 ? Math.round(bullRatio * 22) : 6;
+  const wS = totalWeight > 0 ? Math.round(bearRatio * 22) : 6;
+  const label = snapshots.length
+    ? snapshots.map((s) => `${s.tf}:${s.bias === 'BULLISH' ? 'BULL' : s.bias === 'BEARISH' ? 'BEAR' : 'FLAT'}`).join(' · ')
+    : `${prof.htf}: SELF`;
+
+  return {
+    snapshots,
+    primaryBias,
+    macroBias,
+    wB,
+    wS,
+    label,
   };
 }
 
@@ -750,6 +847,7 @@ export interface EvaluateSetupContext {
   freshness: { available: boolean; fresh: boolean; status: string; label: string };
   historicalMode?: boolean;
   simQuote?: { bid: number; ask: number; mid: number; spread: number } | null;
+  mtfBars?: Partial<Record<TimeframeKey, CandleBar[] | null>>;
 }
 
 export function evaluateSetup(
@@ -837,50 +935,78 @@ export function evaluateSetup(
   const macd = calculateMACD(closes);
   const sq = calculateSqueezeAndBands(closes, atr14);
   const { regime, danger } = classifyMarketRegimeAndDanger(closedBars, atrS, quote.spread, prof.maxSpreadRatioAtr, sq.squeezeOn);
-  const keyLevels = extractKeyLevels(closedBars, d1Bars, h1Bars, atr14, symbol, quote.mid);
+  const h4Bars = ctx.mtfBars?.H4 || null;
+  const keyLevels = extractKeyLevels(closedBars, d1Bars, h1Bars, atr14, symbol, quote.mid, h4Bars);
   const st = analyzeMarketStructure(closedBars, atr14, symbol, prof.bosLookback);
   const { ob, breaker } = detectOrderAndBreakerBlocks(closedBars, st, symbol);
   const fvg = analyzeFVGs(closedBars, atr14, symbol);
   const tr = detectFastAndKeyTriggers(closedBars, keyLevels, atr14, e8, e21, macd, sq, st);
   const srRev = detectSRReversal(closedBars, formingBar, quote.mid, keyLevels, atr14, rsi14, symbol);
-  const htf =
-    tf === prof.htf
-      ? { bias: e8 > e21 ? 'BULLISH' : 'BEARISH', wB: e8 > e21 ? 15 : 0, wS: e8 < e21 ? 15 : 0, label: `${htfLabel}: SELF` }
-      : evaluateHTFContext(htfBars, htfLabel, symbol);
+  const mtf = evaluateMultiTimeframeContext(tf, ctx.mtfBars, htfBars, h1Bars, d1Bars, symbol);
 
+  // Sideways / Chop detection: flat tangled EMA 8/21, tight overlapping range box, or low ADX+ER
+  const e21Prev4 = e21S[Math.max(0, e21S.length - 5)];
+  const emaGapAtr = atr14 > 0 ? Math.abs(e8 - e21) / atr14 : 0;
+  const emaSlopeAtr = atr14 > 0 ? Math.abs(e21 - e21Prev4) / atr14 : 0;
+  const recent12 = closedBars.slice(-12);
+  const boxSpanAtr =
+    atr14 > 0
+      ? (Math.max(...recent12.map((b) => b.high)) - Math.min(...recent12.map((b) => b.low))) / atr14
+      : 3;
+  const isTangledEma = emaGapAtr < 0.20 && emaSlopeAtr < 0.15 && (regime.adx < 22 || regime.er < 0.20);
+  const isTightBox = boxSpanAtr < 2.6 && st.type === 'NEUTRAL' && (regime.adx < 22 || regime.er < 0.20);
+  const isLowQualityChop = (regime.adx < 18.5 && regime.er < 0.22) || (regime.er < 0.12 && emaGapAtr < 0.22);
+  const hasBoundaryBreakout =
+    (srRev.active && boxSpanAtr >= 2.2) ||
+    tr.squeezeBreakBull ||
+    tr.squeezeBreakBear ||
+    tr.srBreakoutBull ||
+    tr.srBreakoutBear ||
+    Boolean(st.sweep && st.kind === 'CHoCH');
+  const sidewayBlocked = (isLowQualityChop || isTangledEma || isTightBox) && !hasBoundaryBreakout;
+
+  // Strategy Conviction Scoring: anchored to S/R, ICT (FVG/OB/Breaker/Sweep/BOS), Squeeze, and MTF Confluence
   let bScore = 0;
   let bStrat = '';
-  if (srRev.active && srRev.side === 'BUY') { bScore += 35; bStrat = `REVERSAL AT ${srRev.zoneName}`; }
-  if (tr.squeezeBreakBull) { bScore += 35; bStrat = bStrat || 'SQUEEZE BREAK'; }
-  if (tr.fastMomentumBull) { bScore += 30; bStrat = bStrat || 'MOMENTUM 8/21'; }
-  if (tr.srBullBounce) { bScore += 30; bStrat = bStrat || 'S/R BOUNCE'; }
-  if (tr.srBreakoutBull || tr.bullBreakRetest) { bScore += 25; bStrat = bStrat || 'S/R BREAKOUT'; }
-  if (tr.paBull) { bScore += 20; bStrat = bStrat || 'PRICE ACTION'; }
-  if (e8 > e21) bScore += 15;
-  if (st.type === 'BULLISH') bScore += 15;
-  if (fvg.retestedBullFvg || ob.type === 'BULLISH' || breaker.type === 'BULLISH') bScore += 10;
-  bScore += htf.wB;
-  if (rsi14 !== null && rsi14 >= 40 && rsi14 < 78) bScore += 10;
+  if (srRev.active && srRev.side === 'BUY') { bScore += 32; bStrat = `REVERSAL AT ${srRev.zoneName}`; }
+  if (tr.squeezeBreakBull) { bScore += 30; bStrat = bStrat || 'SQUEEZE BREAK'; }
+  if (tr.srBullBounce) { bScore += 28; bStrat = bStrat || 'S/R BOUNCE'; }
+  if (tr.srBreakoutBull || tr.bullBreakRetest) { bScore += 26; bStrat = bStrat || 'S/R BREAKOUT'; }
+  if (st.sweep?.type === 'BULLISH') { bScore += 22; bStrat = bStrat || 'ICT SWEEP'; }
+  if (fvg.retestedBullFvg || (ob.type === 'BULLISH' && ob.retested) || breaker.type === 'BULLISH') {
+    bScore += 20;
+    bStrat = bStrat || (fvg.retestedBullFvg ? 'ICT FVG RETEST' : ob.retested ? 'ICT OB RETEST' : 'ICT BREAKER');
+  }
+  if (tr.fastMomentumBull && regime.adx >= 20 && regime.er >= 0.24) { bScore += 20; bStrat = bStrat || 'TREND MOMENTUM'; }
+  if (st.type === 'BULLISH') { bScore += 15; bStrat = bStrat || `ICT ${st.kind}`; }
+  if (e8 > e21 && emaGapAtr >= 0.18) bScore += 10;
+  bScore += mtf.wB;
+  if (rsi14 !== null && rsi14 >= 42 && rsi14 < 76) bScore += 8;
+  if (mtf.primaryBias === 'BEARISH') bScore -= 16;
   bScore = Math.max(0, Math.min(100, bScore));
 
   let sScore = 0;
   let sStrat = '';
-  if (srRev.active && srRev.side === 'SELL') { sScore += 35; sStrat = `REVERSAL AT ${srRev.zoneName}`; }
-  if (tr.squeezeBreakBear) { sScore += 35; sStrat = sStrat || 'SQUEEZE BREAK'; }
-  if (tr.fastMomentumBear) { sScore += 30; sStrat = sStrat || 'MOMENTUM 8/21'; }
-  if (tr.srBearReject) { sScore += 30; sStrat = sStrat || 'S/R REJECT'; }
-  if (tr.srBreakoutBear || tr.bearBreakRetest) { sScore += 25; sStrat = sStrat || 'S/R BREAKOUT'; }
-  if (tr.paBear) { sScore += 20; sStrat = sStrat || 'PRICE ACTION'; }
-  if (e8 < e21) sScore += 15;
-  if (st.type === 'BEARISH') sScore += 15;
-  if (fvg.retestedBearFvg || ob.type === 'BEARISH' || breaker.type === 'BEARISH') sScore += 10;
-  sScore += htf.wS;
-  if (rsi14 !== null && rsi14 <= 60 && rsi14 > 22) sScore += 10;
+  if (srRev.active && srRev.side === 'SELL') { sScore += 32; sStrat = `REVERSAL AT ${srRev.zoneName}`; }
+  if (tr.squeezeBreakBear) { sScore += 30; sStrat = sStrat || 'SQUEEZE BREAK'; }
+  if (tr.srBearReject) { sScore += 28; sStrat = sStrat || 'S/R REJECT'; }
+  if (tr.srBreakoutBear || tr.bearBreakRetest) { sScore += 26; sStrat = sStrat || 'S/R BREAKOUT'; }
+  if (st.sweep?.type === 'BEARISH') { sScore += 22; sStrat = sStrat || 'ICT SWEEP'; }
+  if (fvg.retestedBearFvg || (ob.type === 'BEARISH' && ob.retested) || breaker.type === 'BEARISH') {
+    sScore += 20;
+    sStrat = sStrat || (fvg.retestedBearFvg ? 'ICT FVG RETEST' : ob.retested ? 'ICT OB RETEST' : 'ICT BREAKER');
+  }
+  if (tr.fastMomentumBear && regime.adx >= 20 && regime.er >= 0.24) { sScore += 20; sStrat = sStrat || 'TREND MOMENTUM'; }
+  if (st.type === 'BEARISH') { sScore += 15; sStrat = sStrat || `ICT ${st.kind}`; }
+  if (e8 < e21 && emaGapAtr >= 0.18) sScore += 10;
+  sScore += mtf.wS;
+  if (rsi14 !== null && rsi14 <= 58 && rsi14 > 24) sScore += 8;
+  if (mtf.primaryBias === 'BULLISH') sScore -= 16;
   sScore = Math.max(0, Math.min(100, sScore));
 
   const dom: 'BUY' | 'SELL' = bScore >= sScore ? 'BUY' : 'SELL';
   const score = Math.max(bScore, sScore);
-  const stratName = (dom === 'BUY' ? bStrat : sStrat) || 'TREND FOLLOW';
+  const stratName = (dom === 'BUY' ? bStrat : sStrat) || 'S/R + ICT';
   const r3H = Math.max(...closedBars.slice(-3).map((c) => c.high));
   const r3L = Math.min(...closedBars.slice(-3).map((c) => c.low));
 
@@ -929,34 +1055,102 @@ export function evaluateSetup(
     ? `Advisory: ${rc.reason}`
     : `Lot ${rc.lots.toFixed(2)} (${(danger.riskScale * 100).toFixed(0)}%)`;
 
-  const fastSignalOk =
+  const hasStrategyTrigger =
     dom === 'BUY'
-      ? (srRev.active && srRev.side === 'BUY') || tr.fastMomentumBull || tr.squeezeBreakBull || tr.srBullBounce || tr.srBreakoutBull || tr.bullBreakRetest || tr.paBull
-      : (srRev.active && srRev.side === 'SELL') || tr.fastMomentumBear || tr.squeezeBreakBear || tr.srBearReject || tr.srBreakoutBear || tr.bearBreakRetest || tr.paBear;
+      ? (srRev.active && srRev.side === 'BUY') ||
+        tr.squeezeBreakBull ||
+        tr.srBullBounce ||
+        tr.srBreakoutBull ||
+        tr.bullBreakRetest ||
+        fvg.retestedBullFvg ||
+        (ob.type === 'BULLISH' && ob.retested) ||
+        breaker.type === 'BULLISH' ||
+        st.sweep?.type === 'BULLISH' ||
+        (st.type === 'BULLISH' && tr.paBull) ||
+        (tr.fastMomentumBull && regime.adx >= 20 && regime.er >= 0.24)
+      : (srRev.active && srRev.side === 'SELL') ||
+        tr.squeezeBreakBear ||
+        tr.srBearReject ||
+        tr.srBreakoutBear ||
+        tr.bearBreakRetest ||
+        fvg.retestedBearFvg ||
+        (ob.type === 'BEARISH' && ob.retested) ||
+        breaker.type === 'BEARISH' ||
+        st.sweep?.type === 'BEARISH' ||
+        (st.type === 'BEARISH' && tr.paBear) ||
+        (tr.fastMomentumBear && regime.adx >= 20 && regime.er >= 0.24);
+
   const notChased = dom === 'BUY' ? tr.notChasedBull : tr.notChasedBear;
 
+  // Room-to-S/R obstacle guard (avoid buying right under multi-touch R1/structural ceiling or selling right onto S1)
+  const nearUpperWall = keyLevels.all.find(
+    (c) =>
+      (c.touches >= 2 || !c.tags.has('Round')) &&
+      c.price >= lv.entry - atr14 * 0.15 &&
+      c.price - lv.entry < lv.dist * 0.65
+  );
+  const nearLowerWall = keyLevels.all.find(
+    (c) =>
+      (c.touches >= 2 || !c.tags.has('Round')) &&
+      c.price <= lv.entry + atr14 * 0.15 &&
+      lv.entry - c.price < lv.dist * 0.65
+  );
+  const r1IsStructural = Boolean(keyLevels.r1 && (keyLevels.r1.touches >= 2 || !keyLevels.r1.tags.includes('Round')));
+  const s1IsStructural = Boolean(keyLevels.s1 && (keyLevels.s1.touches >= 2 || !keyLevels.s1.tags.includes('Round')));
+  const blockedIntoR1 =
+    dom === 'BUY' &&
+    !tr.srBreakoutBull &&
+    !tr.squeezeBreakBull &&
+    ((r1IsStructural && keyLevels.r1 !== null && keyLevels.r1.price - lv.entry < lv.dist * 0.65) ||
+      Boolean(nearUpperWall));
+  const blockedIntoS1 =
+    dom === 'SELL' &&
+    !tr.srBreakoutBear &&
+    !tr.squeezeBreakBear &&
+    ((s1IsStructural && keyLevels.s1 !== null && lv.entry - keyLevels.s1.price < lv.dist * 0.65) ||
+      Boolean(nearLowerWall));
+  const obstaclePriceR = keyLevels.r1 && r1IsStructural && keyLevels.r1.price - lv.entry < lv.dist * 0.65 ? keyLevels.r1.price : nearUpperWall?.price;
+  const obstaclePriceS = keyLevels.s1 && s1IsStructural && lv.entry - keyLevels.s1.price < lv.dist * 0.65 ? keyLevels.s1.price : nearLowerWall?.price;
+  const srObstacleMsg = blockedIntoR1 && obstaclePriceR
+    ? `Blocked near R1 (${fmtPrice(obstaclePriceR, symbol)}) — wait break > R1 or pullback S1`
+    : blockedIntoS1 && obstaclePriceS
+    ? `Blocked near S1 (${fmtPrice(obstaclePriceS, symbol)}) — wait break < S1 or rally R1`
+    : null;
+
+  // Counter-HTF guard: don't trade against primary HTF unless explicit S/R Reversal or ICT CHoCH/Sweep + strong score
+  const htfOpposite =
+    (dom === 'BUY' && mtf.primaryBias === 'BEARISH') ||
+    (dom === 'SELL' && mtf.primaryBias === 'BULLISH');
+  const hasCounterHtfReversal =
+    (srRev.active && srRev.side === dom) ||
+    st.kind === 'CHoCH' ||
+    Boolean(st.sweep && st.sweep.type === (dom === 'BUY' ? 'BULLISH' : 'BEARISH'));
+  const blockedByHtf = htfOpposite && (!hasCounterHtfReversal || score < 60);
+
   const rules = [
-    { name: 'Fast Trigger', pass: fastSignalOk, detail: stratName },
-    { name: 'EMA 8/21 + MACD', pass: dom === 'BUY' ? e8 >= e21 || macd.hist >= 0 : e8 <= e21 || macd.hist <= 0, detail: macd.hist >= 0 ? 'Bull Mom' : 'Bear Mom' },
-    { name: 'Squeeze / Regime', pass: regime.regime !== 'LOW_VOL', detail: sq.squeezeOn ? 'Squeeze ON' : regime.regime },
+    { name: 'S/R + ICT Setup', pass: hasStrategyTrigger && !srObstacleMsg, detail: srObstacleMsg ? 'Near S/R Wall' : stratName },
+    { name: 'EMA 8/21 + MACD', pass: dom === 'BUY' ? e8 > e21 && macd.hist >= 0 : e8 < e21 && macd.hist <= 0, detail: emaGapAtr < 0.20 ? 'EMA Flat' : macd.hist >= 0 ? 'Bull Mom' : 'Bear Mom' },
+    { name: 'No Sideways Chop', pass: !sidewayBlocked, detail: sidewayBlocked ? `Sideway (ADX ${regime.adx.toFixed(0)})` : sq.squeezeOn ? 'Squeeze ON' : regime.regime },
     { name: 'Anti-Spike Guard', pass: notChased, detail: notChased ? 'Clear' : 'Extreme Spike' },
-    { name: `HTF (${htfLabel})`, pass: (dom === 'BUY' ? htf.wB : htf.wS) > 0, detail: htf.bias },
+    { name: `MTF (${prof.htf}+)`, pass: !blockedByHtf && mtf.macroBias !== (dom === 'BUY' ? 'BEARISH' : 'BULLISH'), detail: mtf.label },
     { name: 'S/R Key Levels', pass: Boolean(keyLevels.s1 || keyLevels.r1), detail: srRev.active ? srRev.reason : keyLevels.s1 && keyLevels.r1 ? 'S1/R1 OK' : 'Partial' },
     { name: 'Danger Tier', pass: danger.pct < 65, detail: `${danger.pct}%` },
     { name: 'Net R:R', pass: netR1 >= 0.5, detail: `${netR1.toFixed(2)}R` },
   ];
 
-  // Only wait when dead chop (ADX < 14 & ER < 0.14 with no trigger) or extreme blow-off spike
-  if (regime.adx < 14 && regime.er < 0.14 && !fastSignalOk) {
+  // Hard WAIT on Sideways / Choppy Market so signals never fire in dead range
+  if (sidewayBlocked) {
     return mk({
       state: 'WAIT',
       type: 'WAIT',
+      sidewayBlocked: true,
       danger,
       regime,
       keyLevels,
-      setupScore: score,
+      setupScore: Math.min(score, 44),
       rules,
-      htfSummary: htf.label,
+      htfSummary: mtf.label,
+      mtfBreakdown: mtf.snapshots,
       ema8: e8,
       ema21: e21,
       macdHist: macd.hist,
@@ -970,17 +1164,18 @@ export function evaluateSetup(
       reversalInfo: srRev,
       reversalWarning: srRev.active,
       diagVeto: riskAdv,
-      diagSetup: `Dead Chop (ADX ${regime.adx.toFixed(1)})`,
-      diagTrigger: 'Wait S1/R1 breakout',
-      reason: `WAIT: Dead Flat Market (ADX ${regime.adx.toFixed(1)})`,
+      diagSetup: `Sideway / Chop (ADX ${regime.adx.toFixed(1)})`,
+      diagTrigger: 'Wait S1/R1 breakout or ICT FVG/OB bounce',
+      reason: `WAIT: Sideways Range (ADX ${regime.adx.toFixed(1)} · Wait S1/R1)`,
     });
   }
 
-  if (score >= 40 && fastSignalOk && notChased && netR1 >= 0.5) {
+  if (score >= 52 && hasStrategyTrigger && notChased && !srObstacleMsg && !blockedByHtf && netR1 >= 0.5) {
     const mode = `${stratName}${danger.tier !== 'CLEAN' ? ` (${Math.round(danger.riskScale * 100)}% RISK)` : ''}`;
     return mk({
       state: 'READY',
       type: dom,
+      sidewayBlocked: false,
       entryMode: mode,
       entry: lv.entry,
       entryZone: lv.entryZone,
@@ -994,7 +1189,8 @@ export function evaluateSetup(
       danger,
       regime,
       keyLevels,
-      htfSummary: htf.label,
+      htfSummary: mtf.label,
+      mtfBreakdown: mtf.snapshots,
       setupScore: score,
       rules,
       riskCalc: rc,
@@ -1027,20 +1223,26 @@ export function evaluateSetup(
 
   const reasonWait = !notChased
     ? 'Extreme blow-off spike — wait pullback'
-    : !fastSignalOk
-    ? `Bias ${dom} (${score}%) — awaiting fast candle confirmation`
-    : `Net R:R ${netR1.toFixed(2)}R low`;
+    : srObstacleMsg
+    ? srObstacleMsg
+    : blockedByHtf
+    ? `Counter-${prof.htf} (${mtf.primaryBias}) — wait HTF alignment or S/R Reversal`
+    : !hasStrategyTrigger
+    ? `Bias ${dom} (${score}%) — awaiting S/R or ICT confirmation`
+    : `Score ${score}% < 52% or low R:R (${netR1.toFixed(2)}R)`;
 
   return mk({
-    state: score >= 35 ? 'WATCH' : 'WAIT',
+    state: score >= 45 ? 'WATCH' : 'WAIT',
     type: 'WAIT',
+    sidewayBlocked: false,
     entryMode: `${dom} BIAS ${score}%`,
     entryZone: tgtLvl,
     watchNote: srRev.active ? srRev.reason : `${dom} BIAS (${score}%) · ${reasonWait}`,
     danger,
     regime,
     keyLevels,
-    htfSummary: htf.label,
+    htfSummary: mtf.label,
+    mtfBreakdown: mtf.snapshots,
     setupScore: score,
     rules,
     riskCalc: rc,
@@ -1061,7 +1263,7 @@ export function evaluateSetup(
     structure: st,
     ob,
     breaker,
-    reason: `${score >= 35 ? 'WATCH' : 'WAIT'}: ${reasonWait}`,
+    reason: `${score >= 45 ? 'WATCH' : 'WAIT'}: ${reasonWait}`,
   });
 }
 

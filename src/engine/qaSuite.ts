@@ -50,7 +50,7 @@ export async function executeFullQaSuite(
   signalRState: string,
   onLog: (entry: QaLogEntry) => void
 ): Promise<void> {
-  onLog({ text: `Running ${APP_VERSION} 21-Test QA Suite…`, status: 'info' });
+  onLog({ text: `Running ${APP_VERSION} 24-Test QA Suite…`, status: 'info' });
 
   const mockQuotes: QuotesByProvider = { BIQUOTE: {}, EXNESS: {} };
   const defaultRisk: RiskConfig = { balance: 80, riskPercent: 0.5, dailyCap: 1.0, contractMode: 'STANDARD', commission: 0 };
@@ -338,6 +338,81 @@ export async function executeFullQaSuite(
         const rev = detectSRReversal(b, null, 3598.5, kl, 4.0, 68, 'XAUUSD');
         assert(rev.active && rev.side === 'SELL' && rev.zoneName === 'R1', `Expected SELL reversal at R1, got ${JSON.stringify(rev)}`);
         return rev.reason;
+      },
+    ],
+    [
+      '22. Sideways / Chop market blocks false BUY/SELL signals (returns WAIT)',
+      () => {
+        const chop = Array.from({ length: 45 }, (_, i) => 3570 + (i % 2 === 0 ? 0.35 : -0.35));
+        const b = makeSynBars(chop, 0.5);
+        const r = evaluateSetup('XAUUSD', 'M15', b, null, b, b, b, {
+          provider: 'BIQUOTE',
+          riskConfig: defaultRisk,
+          brokerSpecsOverride: {},
+          liveQuote: null,
+          freshness: { available: true, fresh: true, status: 'LIVE', label: 'HISTORICAL' },
+          historicalMode: true,
+          simQuote: { bid: 3570.1, ask: 3570.4, mid: 3570.25, spread: 0.3 },
+        });
+        assert(r.state === 'WAIT' && r.sidewayBlocked === true, `Expected sidewayBlocked WAIT, got ${r.state} (${r.reason})`);
+        return r.reason;
+      },
+    ],
+    [
+      '23. MTF Hierarchy (M1->M5+, M5->M15+, M15->H1/H4/D1/W1)',
+      () => {
+        const up = makeSynBars(Array.from({ length: 45 }, (_, i) => 3550 + i * 1.1), 1.2);
+        const dn = makeSynBars(Array.from({ length: 45 }, (_, i) => 3650 - i * 1.1), 1.2);
+        const m1 = evaluateSetup('XAUUSD', 'M1', up, null, up, up, up, {
+          provider: 'BIQUOTE',
+          riskConfig: defaultRisk,
+          brokerSpecsOverride: {},
+          liveQuote: null,
+          freshness: { available: true, fresh: true, status: 'LIVE', label: 'HISTORICAL' },
+          historicalMode: true,
+          simQuote: { bid: 3598.5, ask: 3598.8, mid: 3598.65, spread: 0.3 },
+          mtfBars: { M5: up, M15: up, H1: up },
+        });
+        const m15 = evaluateSetup('XAUUSD', 'M15', up, null, dn, dn, dn, {
+          provider: 'BIQUOTE',
+          riskConfig: defaultRisk,
+          brokerSpecsOverride: {},
+          liveQuote: null,
+          freshness: { available: true, fresh: true, status: 'LIVE', label: 'HISTORICAL' },
+          historicalMode: true,
+          simQuote: { bid: 3598.5, ask: 3598.8, mid: 3598.65, spread: 0.3 },
+          mtfBars: { H1: dn, H4: dn, D1: dn, W1: dn },
+        });
+        const m1Tfs = (m1.mtfBreakdown || []).map((x) => x.tf).join(',');
+        const m15Tfs = (m15.mtfBreakdown || []).map((x) => x.tf).join(',');
+        assert(m1Tfs.startsWith('M5'), `M1 must inspect M5 first, got ${m1Tfs}`);
+        assert(m15Tfs === 'H1,H4,D1,W1' && m15.state !== 'READY', `M15 must check H1,H4,D1,W1 and guard counter-HTF (${m15Tfs} / ${m15.state})`);
+        return `M1=[${m1Tfs}], M15=[${m15Tfs}]`;
+      },
+    ],
+    [
+      '24. S/R Obstacle Guard blocks BUY right below multi-touch R1 wall',
+      () => {
+        // Build sideways swing ceiling at 3600 touched 3 times, then small rise stopping right under 3600
+        const seq = [
+          3580, 3585, 3592, 3600, 3594, 3588, 3584,
+          3589, 3595, 3600, 3593, 3586, 3583, 3588,
+          3596, 3600, 3592, 3587, 3584, 3586, 3589,
+          3591, 3593, 3595, 3596, 3597, 3598, 3598.5,
+          3598.8, 3599.0, 3599.2,
+        ];
+        const b = makeSynBars(seq, 0.8);
+        const r = evaluateSetup('XAUUSD', 'M15', b, null, b, b, b, {
+          provider: 'BIQUOTE',
+          riskConfig: defaultRisk,
+          brokerSpecsOverride: {},
+          liveQuote: null,
+          freshness: { available: true, fresh: true, status: 'LIVE', label: 'HISTORICAL' },
+          historicalMode: true,
+          simQuote: { bid: 3599.0, ask: 3599.3, mid: 3599.15, spread: 0.3 },
+        });
+        assert(r.state !== 'READY' || r.type !== 'BUY', `Should block BUY directly into R1 ceiling, got ${r.state} ${r.type} (${r.reason})`);
+        return `R1 guard -> ${r.state} (${r.reason})`;
       },
     ],
   ];

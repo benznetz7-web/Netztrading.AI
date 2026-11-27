@@ -49,9 +49,22 @@ export interface TimeframeProfile {
   label: TimeframeKey;
   role: string;
   htf: TimeframeKey;
+  mtfChain: TimeframeKey[];
   cooldownBars: number;
   maxSpreadRatioAtr: number;
   bosLookback: number;
+}
+
+export interface MtfSnapshot {
+  tf: TimeframeKey;
+  bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  regime: string;
+  structure: string;
+  emaTrend: 'BULL' | 'BEAR' | 'FLAT';
+  rsi14: number | null;
+  r1: number | null;
+  s1: number | null;
+  ictNote: string;
 }
 
 export interface QuoteData {
@@ -238,6 +251,8 @@ export interface SignalOutput {
   keyLevels: KeyLevels;
   watchNote: string | null;
   htfSummary: string;
+  mtfBreakdown?: MtfSnapshot[];
+  sidewayBlocked?: boolean;
   setupScore: number;
   rules: RuleCheckItem[];
   diagVeto: string;

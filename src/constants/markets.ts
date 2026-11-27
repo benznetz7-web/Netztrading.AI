@@ -56,14 +56,14 @@ export const SUPPORTED_SYMBOLS = Object.keys(SYMBOL_SPECS);
 export const TIMEFRAME_ORDER: TimeframeKey[] = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'];
 
 export const TF_PROFILES: Record<TimeframeKey, TimeframeProfile> = {
-  M1: { biquote: '1m', seconds: 60, label: 'M1', role: 'Fast Scalp', htf: 'M15', cooldownBars: 3, maxSpreadRatioAtr: 0.45, bosLookback: 22 },
-  M5: { biquote: '5m', seconds: 300, label: 'M5', role: 'Scalp Momentum', htf: 'H1', cooldownBars: 2, maxSpreadRatioAtr: 0.40, bosLookback: 20 },
-  M15: { biquote: '15m', seconds: 900, label: 'M15', role: 'Intraday Setup', htf: 'H1', cooldownBars: 2, maxSpreadRatioAtr: 0.35, bosLookback: 18 },
-  M30: { biquote: '30m', seconds: 1800, label: 'M30', role: 'Intraday Swing', htf: 'H4', cooldownBars: 2, maxSpreadRatioAtr: 0.35, bosLookback: 16 },
-  H1: { biquote: '1h', seconds: 3600, label: 'H1', role: 'HTF Structure', htf: 'H4', cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 16 },
-  H4: { biquote: '4h', seconds: 14400, label: 'H4', role: 'Major Key Levels', htf: 'D1', cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 14 },
-  D1: { biquote: '1d', seconds: 86400, label: 'D1', role: 'Macro Bias', htf: 'W1', cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 14 },
-  W1: { biquote: '1d', seconds: 604800, label: 'W1', role: 'Weekly Macro', htf: 'W1', cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 12 },
+  M1: { biquote: '1m', seconds: 60, label: 'M1', role: 'Fast Scalp', htf: 'M5', mtfChain: ['M5', 'M15', 'H1'], cooldownBars: 3, maxSpreadRatioAtr: 0.45, bosLookback: 22 },
+  M5: { biquote: '5m', seconds: 300, label: 'M5', role: 'Scalp Momentum', htf: 'M15', mtfChain: ['M15', 'H1', 'H4'], cooldownBars: 2, maxSpreadRatioAtr: 0.40, bosLookback: 20 },
+  M15: { biquote: '15m', seconds: 900, label: 'M15', role: 'Intraday Setup', htf: 'H1', mtfChain: ['H1', 'H4', 'D1', 'W1'], cooldownBars: 2, maxSpreadRatioAtr: 0.35, bosLookback: 18 },
+  M30: { biquote: '30m', seconds: 1800, label: 'M30', role: 'Intraday Swing', htf: 'H4', mtfChain: ['H1', 'H4', 'D1', 'W1'], cooldownBars: 2, maxSpreadRatioAtr: 0.35, bosLookback: 16 },
+  H1: { biquote: '1h', seconds: 3600, label: 'H1', role: 'HTF Structure', htf: 'H4', mtfChain: ['H4', 'D1', 'W1'], cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 16 },
+  H4: { biquote: '4h', seconds: 14400, label: 'H4', role: 'Major Key Levels', htf: 'D1', mtfChain: ['D1', 'W1'], cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 14 },
+  D1: { biquote: '1d', seconds: 86400, label: 'D1', role: 'Macro Bias', htf: 'W1', mtfChain: ['W1'], cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 14 },
+  W1: { biquote: '1d', seconds: 604800, label: 'W1', role: 'Weekly Macro', htf: 'W1', mtfChain: [], cooldownBars: 1, maxSpreadRatioAtr: 0.35, bosLookback: 12 },
 };
 
 export interface TranslationSet {
